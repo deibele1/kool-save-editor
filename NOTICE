@@ -1,0 +1,34 @@
+Kool Save Editor for Macintosh
+
+DERIVED FROM GPL SOFTWARE
+This program is named in honor of KSE, the KotOR Savegame Editor, and is a
+Swift translation of parts of two GPL programs:
+  - KotOR Savegame Editor (KSE): Copyright (C) ??-2005 tk102,
+    Copyright (C) 2013-2015 FairStrides, Copyright (C) 2015-2019 KSE Team.
+    https://gitlab.com/kotorsge-team/kse
+  - xoreos-tools: the legal property of its developers, listed in the AUTHORS
+    file of its source distribution. https://github.com/xoreos/xoreos-tools
+Both are licensed under the GNU General Public License, version 3 or (at your
+option) any later version. As those licenses require, this program as a whole is
+distributed under the same terms; see the LICENSE file. It was modified from
+those programs in 2026.
+
+NO COPYRIGHT CLAIMED
+Most of the new code in this program was written by an AI model. The maintainer
+claims no copyright in this program. Copyright in the parts derived from KSE and
+xoreos-tools remains with their authors.
+
+NO WARRANTY, NO LIABILITY
+This program is provided "as is", without warranty of any kind, express or
+implied, including the implied warranties of merchantability and fitness for a
+particular purpose. The maintainer accepts no liability for any damage or loss
+arising from the use of this program or the inability to use it, including
+damaged or lost saved games. Editing saved games can break them. The program
+keeps copies of a save before changing it, but you use it at your own risk.
+See sections 15 and 16 of the GNU General Public License.
+
+NOT AFFILIATED
+Star Wars, Knights of the Old Republic and KotOR are trademarks of Lucasfilm Ltd.
+This program is not made, endorsed or supported by Lucasfilm, Disney, BioWare,
+Obsidian Entertainment, Aspyr Media, the KSE team or the xoreos project. It
+contains no game files; it reads the game installed on your Mac.
