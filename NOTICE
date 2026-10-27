@@ -11,7 +11,8 @@ Swift translation of parts of two GPL programs:
 Both are licensed under the GNU General Public License, version 3 or (at your
 option) any later version. As those licenses require, this program as a whole is
 distributed under the same terms; see the LICENSE file. It was modified from
-those programs in 2026.
+those programs in 2026. Its complete source code is available at
+https://github.com/deibele1/kool-save-editor
 
 NO COPYRIGHT CLAIMED
 Most of the new code in this program was written by an AI model. The maintainer

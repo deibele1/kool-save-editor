@@ -3,6 +3,7 @@ import AppKit
 /// The About box: the standard panel with the license notice and disclaimer as credits.
 enum AboutPanel {
     static let fullName = "Kool Save Editor for Macintosh"
+    static let sourceURL = URL(string: "https://github.com/deibele1/kool-save-editor")!
 
     static func show() {
         NSApp.orderFrontStandardAboutPanel(options: [.applicationName: fullName, .credits: credits()])
@@ -39,6 +40,7 @@ enum AboutPanel {
         }
 
         let links: [(String, URL?)] = [
+            ("Source code", sourceURL),
             ("Full notice", Bundle.main.url(forResource: "NOTICE", withExtension: nil)),
             ("GNU General Public License", Bundle.main.url(forResource: "LICENSE", withExtension: nil)),
             ("KSE", URL(string: "https://gitlab.com/kotorsge-team/kse")),

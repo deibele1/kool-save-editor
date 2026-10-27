@@ -5,6 +5,10 @@ A native macOS (SwiftUI) savegame editor for *Star Wars: Knights of the Old Repu
 everything KSE does, with the BioWare file formats implemented in Swift from
 [xoreos-tools][xoreos]. Nothing from xoreos or KSE is needed at runtime.
 
+**[Download the latest release](https://github.com/deibele1/kool-save-editor/releases/latest)**
+(macOS 14 or later, Apple Silicon and Intel). Open the disk image and drag Kool Save Editor
+to Applications.
+
 ## Features
 
 - Finds saves automatically in the Mac App Store and Steam locations of both games, including
