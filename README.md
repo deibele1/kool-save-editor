@@ -9,6 +9,8 @@ everything KSE does, with the BioWare file formats implemented in Swift from
 (macOS 14 or later, Apple Silicon and Intel). Open the disk image and drag Kool Save Editor
 to Applications.
 
+![Kool Save Editor editing a Jedi Weapon Master, with the save list, the sections of the save and the character sheet](docs/screenshot.png)
+
 ## Features
 
 - Finds saves automatically in the Mac App Store and Steam locations of both games, including
