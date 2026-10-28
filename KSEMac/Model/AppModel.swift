@@ -9,6 +9,8 @@ struct LocationState {
     /// Why the folder can't be read, short enough for the sidebar; `errorHelp` has the details.
     var error: String?
     var errorHelp: String?
+    /// macOS privacy protection blocks the folder; System Settings can allow access.
+    var isBlockedByPrivacy = false
     var isLoading = false
 }
 
@@ -101,6 +103,7 @@ final class AppModel {
                 let problem = Self.describe(error, at: location.url)
                 state.error = problem.message
                 state.errorHelp = problem.help
+                state.isBlockedByPrivacy = problem.isPrivacy
             }
             locationStates[location.id] = state
             for summary in state.summaries { documents[summary.id]?.summary = summary }
@@ -131,14 +134,15 @@ final class AppModel {
     }
     #endif
 
-    /// A short message for the sidebar and the details for its tooltip.
-    static func describe(_ error: Error, at url: URL) -> (message: String, help: String) {
+    /// A short message for the sidebar and the details for its help button.
+    static func describe(_ error: Error, at url: URL) -> (message: String, help: String, isPrivacy: Bool) {
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileReadNoPermissionError {
             return ("Access blocked by macOS",
-                    "Allow Kool Save Editor to access data from other apps in System Settings › Privacy & Security, then refresh the save list.")
+                    "macOS keeps apps out of other apps’ data unless you allow it. Click ? for how to allow access in System Settings.",
+                    true)
         }
-        return ("Can’t read this folder", error.localizedDescription)
+        return ("Can’t read this folder", error.localizedDescription, false)
     }
 
     func location(for id: String) -> (SaveSummary, SaveLocation)? {

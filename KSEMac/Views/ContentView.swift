@@ -168,11 +168,16 @@ struct SidebarView: View {
                 Section {
                     let state = model.locationStates[location.id] ?? LocationState()
                     if let error = state.error {
-                        Label(error, systemImage: "lock.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .help(state.errorHelp ?? error)
-                            .selectionDisabled()
+                        HStack(spacing: 6) {
+                            Label(error, systemImage: "lock.fill")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .help(state.errorHelp ?? error)
+                            if let help = state.errorHelp {
+                                LocationHelpButton(location: location, help: help, isBlockedByPrivacy: state.isBlockedByPrivacy)
+                            }
+                        }
+                        .selectionDisabled()
                     } else if state.summaries.isEmpty, !state.isLoading {
                         Text("No saves").foregroundStyle(.tertiary).selectionDisabled()
                     }
@@ -208,6 +213,105 @@ struct SidebarView: View {
             }
             .buttonStyle(.borderless)
             .padding(8)
+        }
+    }
+}
+
+/// The ? button next to a folder that can't be read. It opens a sheet rather than a popover,
+/// so the steps stay on screen while the user is in System Settings.
+struct LocationHelpButton: View {
+    let location: SaveLocation
+    let help: String
+    let isBlockedByPrivacy: Bool
+
+    @State private var isShowing = false
+
+    var body: some View {
+        HelpLink { isShowing = true }
+            .controlSize(.small)
+            .sheet(isPresented: $isShowing) {
+                FolderAccessSheet(location: location, help: help, isBlockedByPrivacy: isBlockedByPrivacy)
+            }
+    }
+}
+
+struct FolderAccessSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    let location: SaveLocation
+    let help: String
+    let isBlockedByPrivacy: Bool
+
+    /// The game as System Settings lists it under Files & Folders.
+    private var gameName: String {
+        location.game == .kotor1 ? "Knights of the Old Republic" : "Knights of the Old Republic II"
+    }
+
+    /// macOS 27 lists access to other apps' data per app under Files & Folders (confirmed on
+    /// macOS 27); for earlier versions the steps use Full Disk Access, which works on all of them.
+    private var usesFilesAndFolders: Bool {
+        ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
+    }
+
+    private var settingsURL: URL? {
+        URL(string: "x-apple.systempreferences:com.apple.preference.security?" + (usesFilesAndFolders ? "Privacy_FilesAndFolders" : "Privacy_AllFiles"))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Label(isBlockedByPrivacy ? "Allow Access to the Mac App Store Saves" : "Can’t Read This Folder", systemImage: "lock.fill")
+                .font(.headline)
+            if isBlockedByPrivacy {
+                Text("macOS keeps apps out of other apps’ data unless you allow it, and the Mac App Store games keep their saves in their own data.")
+                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 8) {
+                    if usesFilesAndFolders {
+                        step(1, "Click Open Files & Folders. It opens System Settings › Privacy & Security › Files & Folders.")
+                        step(2, "Under Kool Save Editor, turn on \(gameName).")
+                    } else {
+                        step(1, "Click Open Full Disk Access. It opens System Settings › Privacy & Security › Full Disk Access.")
+                        step(2, "Turn on Kool Save Editor. If it isn’t listed, click + and choose it in Applications.")
+                    }
+                    step(3, "Come back and click Quit & Reopen: macOS applies the change when Kool Save Editor starts again.")
+                }
+            } else {
+                Text(help).fixedSize(horizontal: false, vertical: true)
+                Text(location.url.path).font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+            HStack {
+                if isBlockedByPrivacy {
+                    Button(usesFilesAndFolders ? "Open Files & Folders" : "Open Full Disk Access") {
+                        if let settingsURL { NSWorkspace.shared.open(settingsURL) }
+                    }
+                    Button("Quit & Reopen") {
+                        AppDelegate.relaunchesAfterQuit = true
+                        dismiss()
+                        // AppKit refuses to quit (and beeps) while a sheet is open.
+                        Task {
+                            try? await Task.sleep(for: .milliseconds(400))
+                            NSApp.terminate(nil)
+                        }
+                    }
+                } else {
+                    Button("Refresh") {
+                        model.refresh()
+                        dismiss()
+                    }
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(.top, 4)
+        }
+        .padding(20)
+        .frame(width: 460)
+    }
+
+    private func step(_ number: Int, _ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("\(number).").monospacedDigit().foregroundStyle(.secondary)
+            Text(text).fixedSize(horizontal: false, vertical: true)
         }
     }
 }

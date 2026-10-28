@@ -26,8 +26,21 @@ struct KSEMacApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
+    /// Set by Quit & Reopen: a privacy setting changed while the app runs only reaches a new
+    /// process, so a fresh copy is started once this one has quit.
+    static var relaunchesAfterQuit = false
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        guard Self.relaunchesAfterQuit else { return }
+        // Waits for this process to exit, then opens the app again.
+        let relaunch = Process()
+        relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+        relaunch.arguments = ["-c", "while /bin/kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do /bin/sleep 0.2; done; /usr/bin/open \"$0\"",
+                              Bundle.main.bundlePath]
+        try? relaunch.run()
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let model, !model.dirtyDocuments.isEmpty else { return .terminateNow }
@@ -44,12 +57,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .alertFirstButtonReturn:
             Task { @MainActor in
                 let saved = await model.saveAll()
+                if !saved { Self.relaunchesAfterQuit = false }
                 sender.reply(toApplicationShouldTerminate: saved)
             }
             return .terminateLater
         case .alertThirdButtonReturn:
             return .terminateNow
         default:
+            Self.relaunchesAfterQuit = false
             return .terminateCancel
         }
     }
