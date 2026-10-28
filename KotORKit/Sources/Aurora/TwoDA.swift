@@ -109,9 +109,10 @@ public struct TwoDA: Sendable {
         offsets.reserveCapacity(cellCount)
         for i in 0 ..< cellCount { offsets.append(Int(try reader.uint16(at: position + i * 2))) }
         position += cellCount * 2
-        let dataSize = Int(try reader.uint16(at: position))
+        // The data size stored next is skipped, as by xoreos-tools and the game: some modding
+        // tools write 0 there. Cells run to their NUL or the end of the file.
         let dataStart = position + 2
-        let dataEnd = min(bytes.count, dataStart + dataSize)
+        let dataEnd = bytes.count
 
         var cache: [Int: String] = [:]
         let cells = try offsets.map { offset -> String in

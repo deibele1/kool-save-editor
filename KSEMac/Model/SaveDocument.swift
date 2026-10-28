@@ -213,6 +213,12 @@ final class SaveDocument: Identifiable {
         }
     }
 
+    /// Fills in this save's player name where game text says <FullName>, as the game does.
+    var textTokens: TextTokens {
+        let player = save?.creature(.player)
+        return TextTokens(firstName: gameData?.text(player?.firstName) ?? "", lastName: gameData?.text(player?.lastName) ?? "")
+    }
+
     /// A companion slot's name: the sheet's name when present, else the standard name.
     func companionName(_ index: Int) -> String {
         if save?.npcs[index] != nil, let name = gameData?.text(save?.creature(.npc(index))?.firstName), !name.isEmpty { return name }

@@ -16,13 +16,15 @@ to Applications.
 - Finds saves automatically in the Mac App Store and Steam locations of both games, including
   TSL Steam Cloud saves; other folders can be added.
 - Savegame name, time played, cheat flag.
-- Player and companions: name, gender, appearance, portrait (with previews), soundset,
-  attributes, skills, experience, alignment, hit/Force points, Min 1 HP, feats, Force powers,
+- Player and companions: name, gender, appearance and portrait (with previews), voice set
+  (play a random line; includes the player's voice sets), attributes, skills, experience,
+  alignment, hit/Force points, Min 1 HP, feats, Force powers,
   classes (change, add, remove, level), equipment (equip from the game's item blueprints,
   unequip to the inventory).
 - Party: credits, party XP, TSL components and chemicals, the active party, and TSL influence
   for every companion.
-- Inventory: change quantities, remove, add any item blueprint (game or override folder),
+- Inventory: change quantities, remove, add any item: every blueprint in the game files, the
+  override folder and the modules (level files), sortable by type and source,
   copy and paste an inventory between saves.
 - Journal: change quest states, add and remove quests.
 - Global variables: booleans, numbers and strings.
@@ -47,6 +49,10 @@ app looks in the Steam libraries and `/Applications`; otherwise choose the folde
 `Contents/Assets` or `Contents/GameData`). Saves can still be edited without it, with numbers
 shown instead of names.
 
+Voice samples come from the same installation. *The Sith Lords* ships without the player's
+voice sets, so its player character is silent: the editor lists the two the game assigns
+(female and male) as silent, and they become audible once a mod restores them.
+
 macOS asks for permission the first time the app reads the Mac App Store containers
 (“access data from other apps”).
 
@@ -63,7 +69,7 @@ Tools/release.sh                           # signed, notarized DMG in build/ (ma
 
 Layout:
 
-- `KotORKit/Sources/Aurora` – GFF, ERF, KEY/BIF, 2DA, TLK, TPC/TGA and code pages (from xoreos-tools).
+- `KotORKit/Sources/Aurora` – GFF, ERF, KEY/BIF, 2DA, TLK, SSF, TPC/TGA and code pages (from xoreos-tools), and the games' sound containers.
 - `KotORKit/Sources/KotORSave` – save loading and editing, game data, discovery, versions and safe writing (from KSE).
 - `KSEMac` – the SwiftUI app.
 - `Tools/make-icon.swift` – renders the app icon.

@@ -63,6 +63,29 @@ struct NumberField: View {
     }
 }
 
+/// Forgiving search: every word of the query must appear in one of the fields, ignoring case,
+/// accents, apostrophes, other punctuation and a plural "s" ("revans robes" finds
+/// "Darth Revan's Robes"). Underscores and hyphens are kept, so tags and resrefs match whole.
+enum SearchText {
+    static func matches(_ query: String, _ fields: String...) -> Bool {
+        let words = normalized(query).split(separator: " ").map { word in
+            word.count > 3 && word.hasSuffix("s") ? word.dropLast() : word[...]
+        }
+        guard !words.isEmpty else { return true }
+        let haystack = fields.map(normalized).joined(separator: " ")
+        return words.allSatisfy { haystack.contains($0) }
+    }
+
+    static func normalized(_ text: String) -> String {
+        var result = String.UnicodeScalarView()
+        for scalar in text.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil).unicodeScalars
+        where !"'’‘`´".unicodeScalars.contains(scalar) {
+            result.append(CharacterSet.alphanumerics.contains(scalar) || scalar == "_" || scalar == "-" ? scalar : " ")
+        }
+        return String(result)
+    }
+}
+
 struct SearchField: View {
     @Binding var text: String
     var prompt = "Search"
@@ -115,25 +138,49 @@ extension SheetFooter where Leading == EmptyView {
     }
 }
 
-/// Picks one entry of a game table (appearance, soundset, class…).
-struct ChoiceSheet: View {
-    struct Choice: Identifiable, Hashable {
-        let id: Int
-        let title: String
-    }
-
+/// An entry of a game table offered by `ChoiceSheet`.
+struct TableChoice: Identifiable, Hashable {
+    let id: Int
     let title: String
-    let choices: [Choice]
+    var detail: String?
+    /// A texture shown as the row's thumbnail.
+    var image: String?
+    /// Consecutive choices with the same section are listed under it.
+    var section: String?
+}
+
+/// Picks one entry of a game table (appearance, voice set…). `accessory` shows more about
+/// the selected entry under the list.
+struct ChoiceSheet<Accessory: View>: View {
+    let title: String
+    let choices: [TableChoice]
     let current: Int
+    var assets: GameAssets?
+    /// Shows thumbnails of this size, with `placeholder` for choices without an image.
+    var thumbnailSize: CGFloat?
+    var placeholder = "photo"
+    var note: String?
     let choose: (Int) -> Void
+    @ViewBuilder var accessory: (Int?) -> Accessory
 
     @State private var selection: Int?
     @State private var search = ""
     @Environment(\.dismiss) private var dismiss
 
-    private var filtered: [Choice] {
-        guard !search.isEmpty else { return choices }
-        return choices.filter { $0.title.localizedCaseInsensitiveContains(search) || String($0.id) == search }
+    private struct Group: Identifiable {
+        let title: String?
+        var choices: [TableChoice]
+        var id: String { title ?? "" }
+    }
+
+    private var groups: [Group] {
+        var groups: [Group] = []
+        for choice in choices where search.isEmpty || choice.title.localizedCaseInsensitiveContains(search)
+            || choice.detail?.localizedCaseInsensitiveContains(search) == true || String(choice.id) == search {
+            if let last = groups.indices.last, groups[last].title == choice.section { groups[last].choices.append(choice) }
+            else { groups.append(Group(title: choice.section, choices: [choice])) }
+        }
+        return groups
     }
 
     var body: some View {
@@ -143,32 +190,60 @@ struct ChoiceSheet: View {
                 SearchField(text: $search)
             }
             .padding()
-            List(filtered, selection: $selection) { choice in
-                HStack {
-                    Text(choice.title)
-                    Spacer()
-                    Text("\(choice.id)").foregroundStyle(.secondary).monospacedDigit()
+            ScrollViewReader { proxy in
+                List(selection: $selection) {
+                    ForEach(groups) { group in
+                        if let title = group.title {
+                            Section(title) { rows(group.choices) }
+                        } else {
+                            rows(group.choices)
+                        }
+                    }
                 }
-                .tag(choice.id)
+                .contextMenu(forSelectionType: Int.self) { _ in } primaryAction: { ids in
+                    if let id = ids.first { choose(id); dismiss() }
+                }
+                .onAppear {
+                    selection = current
+                    Task { proxy.scrollTo(current, anchor: .center) }
+                }
             }
-            .contextMenu(forSelectionType: Int.self) { _ in } primaryAction: { ids in
-                if let id = ids.first { choose(id); dismiss() }
+            if let note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding([.horizontal, .top])
             }
-            Divider()
+            accessory(selection)
+                .padding(.horizontal)
+                .padding(.top, 10)
+            Divider().padding(.top, 10)
             SheetFooter(confirmTitle: "Choose", confirmDisabled: selection == nil) {
                 if let selection { choose(selection) }
             }
         }
-        .frame(width: 460, height: 560)
-        .onAppear { selection = current }
+        .frame(width: 500, height: 620)
     }
-}
 
-extension ChoiceSheet.Choice {
-    static func from(_ table: [Int: String], including current: Int, missing: (Int) -> String) -> [ChoiceSheet.Choice] {
-        var entries = table.map { ChoiceSheet.Choice(id: $0.key, title: $0.value) }
-        if table[current] == nil { entries.append(.init(id: current, title: missing(current))) }
-        return entries.sorted { ($0.title.localizedLowercase, $0.id) < ($1.title.localizedLowercase, $1.id) }
+    private func rows(_ choices: [TableChoice]) -> some View {
+        ForEach(choices) { choice in
+            HStack(spacing: 10) {
+                if let thumbnailSize {
+                    GameImage(name: choice.image, assets: assets, placeholder: placeholder)
+                        .frame(width: thumbnailSize, height: thumbnailSize)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(choice.title)
+                    if let detail = choice.detail {
+                        Text(detail).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Text("\(choice.id)").foregroundStyle(.secondary).monospacedDigit()
+            }
+            .tag(choice.id)
+        }
     }
 }
 

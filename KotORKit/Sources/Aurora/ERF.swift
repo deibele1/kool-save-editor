@@ -186,13 +186,48 @@ public struct ERFArchive: Equatable, Sendable {
     }
 }
 
+/// A resource listed in an archive.
+public struct ArchiveEntry: Sendable, Hashable {
+    public var resRef: String
+    public var type: ResourceType
+
+    public init(resRef: String, type: ResourceType) {
+        self.resRef = resRef
+        self.type = type
+    }
+}
+
+/// Read-only, memory-mapped access to an archive's resources (ERF family or RIM).
+public protocol ArchiveIndex: Sendable {
+    /// Every resource in archive order, resource names lowercased.
+    var entries: [ArchiveEntry] { get }
+    func data(for resRef: String, type: ResourceType) -> [UInt8]?
+}
+
+/// Opens an ERF, MOD, SAV, HAK or RIM file, whichever its header says it is.
+public func openArchiveIndex(at url: URL) throws -> any ArchiveIndex {
+    let data = try Data(contentsOf: url, options: .alwaysMapped)
+    return String(decoding: data.prefix(4), as: UTF8.self) == "RIM " ? try RIMIndex(data: data) : try ERFIndex(data: data)
+}
+
+/// Shared by the archive indexes: the bytes of a slot, if it lies inside the file.
+func mappedSlice(_ data: Data, _ slot: (offset: Int, size: Int)?) -> [UInt8]? {
+    guard let slot, slot.offset <= data.count, slot.size <= data.count - slot.offset else { return nil }
+    let start = data.startIndex + slot.offset
+    return [UInt8](data[start ..< start + slot.size])
+}
+
 /// Read-only, memory-mapped access to a large ERF such as a texture pack.
-public struct ERFIndex: Sendable {
+public struct ERFIndex: ArchiveIndex {
+    public let entries: [ArchiveEntry]
     private let data: Data
     private let slots: [String: (offset: Int, size: Int)]
 
     public init(url: URL) throws {
-        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        try self.init(data: Data(contentsOf: url, options: .alwaysMapped))
+    }
+
+    public init(data: Data) throws {
         let header = BinaryReader([UInt8](data.prefix(ERFArchive.headerSize)))
         guard ["ERF ", "MOD ", "SAV ", "HAK "].contains(try header.fixedString(at: 0, length: 4)) else {
             throw AuroraError.invalidFormat("not an ERF archive")
@@ -206,20 +241,20 @@ public struct ERFIndex: Sendable {
         }
         let keys = BinaryReader([UInt8](data[data.startIndex + keyOffset ..< data.startIndex + keyOffset + count * 24]))
         let table = BinaryReader([UInt8](data[data.startIndex + resourceOffset ..< data.startIndex + resourceOffset + count * 8]))
+        var entries: [ArchiveEntry] = []
         var slots: [String: (offset: Int, size: Int)] = [:]
         for i in 0 ..< count {
             let resRef = try keys.fixedString(at: i * 24, length: 16).lowercased()
             let type = try keys.uint16(at: i * 24 + 20)
+            entries.append(ArchiveEntry(resRef: resRef, type: ResourceType(rawValue: type)))
             slots["\(resRef).\(type)"] = (Int(try table.uint32(at: i * 8)), Int(try table.uint32(at: i * 8 + 4)))
         }
+        self.entries = entries
         self.data = data
         self.slots = slots
     }
 
     public func data(for resRef: String, type: ResourceType) -> [UInt8]? {
-        guard let slot = slots["\(resRef.lowercased()).\(type.rawValue)"], slot.offset <= data.count,
-              slot.size <= data.count - slot.offset else { return nil }
-        let start = data.startIndex + slot.offset
-        return [UInt8](data[start ..< start + slot.size])
+        mappedSlice(data, slots["\(resRef.lowercased()).\(type.rawValue)"])
     }
 }

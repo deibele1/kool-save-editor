@@ -171,6 +171,7 @@ struct SidebarView: View {
                         Label(error, systemImage: "lock.fill")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .help(state.errorHelp ?? error)
                             .selectionDisabled()
                     } else if state.summaries.isEmpty, !state.isLoading {
                         Text("No saves").foregroundStyle(.tertiary).selectionDisabled()

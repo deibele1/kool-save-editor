@@ -113,6 +113,7 @@ public struct Creature: Sendable, Equatable {
     // MARK: Identity
 
     public var firstName: GFFLocString? { root.locString("FirstName") }
+    public var lastName: GFFLocString? { root.locString("LastName") }
 
     public mutating func setFirstName(_ name: String) {
         for label in ["FirstName", "Mod_FirstName"] {

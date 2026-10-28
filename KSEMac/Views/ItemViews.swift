@@ -23,6 +23,7 @@ struct EquipmentView: View {
     var body: some View {
         let creature = document.save?.creature(character)
         let data = document.gameData
+        let tokens = document.textTokens
         VStack(alignment: .leading, spacing: 10) {
             List {
                 ForEach(EquipmentSlot.slots(for: document.game)) { slot in
@@ -34,7 +35,7 @@ struct EquipmentView: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(slot.title).font(.caption).foregroundStyle(.secondary)
                             if let item {
-                                Text(data?.itemName(item) ?? item.string("Tag") ?? "Item")
+                                Text(tokens.apply(data?.itemName(item) ?? item.string("Tag") ?? "Item"))
                                 Text(item.string("Tag") ?? "").font(.caption2).foregroundStyle(.tertiary)
                             } else {
                                 Text("Empty").foregroundStyle(.tertiary)
@@ -60,9 +61,9 @@ struct EquipmentView: View {
         .padding(.top, 8)
         .sheet(item: $picking) { slot in
             if let data {
-                ItemPickerSheet(mode: .equip(slot), gameData: data, owned: []) { templates, _ in
-                    guard let first = templates.first, let template = data.itemTemplate(first.resRef) else { return }
-                    document.edit("Equip \(first.name.isEmpty ? first.resRef : first.name)") {
+                ItemPickerSheet(mode: .equip(slot), gameData: data, tokens: tokens, owned: []) { templates, _ in
+                    guard let first = templates.first, let template = data.itemTemplate(first) else { return }
+                    document.edit("Equip \(first.name.isEmpty ? first.resRef : tokens.apply(first.name))") {
                         $0.equip(template, slot: slot, on: character)
                     }
                 }
@@ -71,7 +72,7 @@ struct EquipmentView: View {
     }
 }
 
-/// Browses the game's item blueprints (templates BIF and override folder).
+/// Browses every item blueprint: the game's BIFs, the override folder and the modules (level files).
 struct ItemPickerSheet: View {
     enum Mode {
         case equip(EquipmentSlot)
@@ -84,42 +85,55 @@ struct ItemPickerSheet: View {
         case wearable = "Wearable"
         case other = "Other"
         case override = "Override"
+        case modules = "Modules"
         var id: Self { self }
+    }
+
+    nonisolated struct TemplateRow: Identifiable, Sendable {
+        var template: ItemTemplate
+        var name: String
+        var type: String
+        var id: String { template.id }
+        var tag: String { template.tag }
+        var resRef: String { template.resRef }
+        /// Game, Override, or the module (level) the blueprint was found in.
+        var source: String { template.module ?? (template.isOverride ? "Override" : "Game") }
     }
 
     let mode: Mode
     let gameData: GameData
+    /// The save's player name, for names like TSL's "<FullName> Crystal".
+    let tokens: TextTokens
     let owned: Set<String>
     let add: ([ItemTemplate], Int) -> Void
 
-    @State private var templates: [ItemTemplate] = []
+    @State private var rows: [TemplateRow] = []
     @State private var loading = true
     @State private var search = ""
     @State private var filter = Filter.all
     @State private var selection = Set<String>()
     @State private var quantity = 1
     @State private var description: String?
-    @State private var sortOrder = [KeyPathComparator(\ItemTemplate.name)]
+    @State private var sortOrder = [KeyPathComparator(\TemplateRow.name)]
     @Environment(\.dismiss) private var dismiss
 
     private var isEquipping: Bool { if case .equip = mode { true } else { false } }
 
-    private var visible: [ItemTemplate] {
-        templates.filter { template in
-            let slots = gameData.baseItems[template.baseItem]?.equipableSlots ?? 0
+    private var visible: [TemplateRow] {
+        rows.filter { row in
+            let slots = gameData.baseItems[row.template.baseItem]?.equipableSlots ?? 0
             if case .equip(let slot) = mode, slots & slot.equipBit == 0 { return false }
             switch filter {
             case .all: break
             case .weapons: if slots & 0x30 == 0 { return false }
             case .wearable: if slots == 0 || slots & 0x30 != 0 { return false }
             case .other: if slots != 0 { return false }
-            case .override: if !template.isOverride { return false }
+            case .override: if !row.template.isOverride { return false }
+            case .modules: if row.template.archive == nil { return false }
             }
-            guard !search.isEmpty else { return true }
-            return template.name.localizedCaseInsensitiveContains(search) || template.tag.localizedCaseInsensitiveContains(search)
-                || template.resRef.localizedCaseInsensitiveContains(search)
+            return SearchText.matches(search, row.name, row.type, row.tag, row.resRef, row.source)
         }
-        .sorted(using: sortOrder)
+        .sorted(using: sortOrder + [KeyPathComparator(\TemplateRow.name), KeyPathComparator(\TemplateRow.resRef)])
     }
 
     var body: some View {
@@ -127,7 +141,7 @@ struct ItemPickerSheet: View {
             VStack(alignment: .leading, spacing: 10) {
                 Text(title).font(.headline)
                 HStack {
-                    SearchField(text: $search, prompt: "Search names, tags and resrefs")
+                    SearchField(text: $search, prompt: "Search names, types, tags and resrefs")
                     if !isEquipping {
                         Picker("Show", selection: $filter) {
                             ForEach(Filter.allCases) { Text($0.rawValue).tag($0) }
@@ -139,30 +153,39 @@ struct ItemPickerSheet: View {
             .padding()
 
             Table(visible, selection: $selection, sortOrder: $sortOrder) {
-                TableColumn("Name", value: \.name) { template in
+                TableColumn("Name", value: \.name) { row in
                     HStack(spacing: 6) {
-                        GameImage(name: gameData.itemIcon(baseItem: template.baseItem, modelVariation: template.modelVariation),
+                        GameImage(name: gameData.itemIcon(baseItem: row.template.baseItem, modelVariation: row.template.modelVariation),
                                   assets: gameData.assets, placeholder: "shippingbox")
                             .frame(width: 22, height: 22)
-                        Text(template.name.isEmpty ? template.resRef : template.name)
-                            .foregroundStyle(owned.contains(template.tag.lowercased()) ? Color.accentColor : .primary)
-                        if template.isOverride {
-                            Text("Override").font(.caption2).padding(.horizontal, 4).background(.orange.opacity(0.2), in: Capsule())
+                        Text(row.name)
+                            .foregroundStyle(owned.contains(row.tag.lowercased()) ? Color.accentColor : .primary)
+                        if row.template.isPlot {
+                            Text("Quest").font(.caption2).padding(.horizontal, 4).background(.purple.opacity(0.2), in: Capsule())
+                                .help("A quest item: having it, or not, can change what quests and dialog do")
                         }
                     }
                 }
-                TableColumn("Type") { template in
-                    Text(gameData.baseItemName(template.baseItem)).foregroundStyle(.secondary)
+                .width(min: 200, ideal: 290)
+                TableColumn("Type", value: \.type) { row in
+                    Text(row.type).foregroundStyle(.secondary)
                 }
                 .width(min: 90, ideal: 130)
-                TableColumn("Tag", value: \.tag) { template in
-                    Text(template.tag).font(.callout.monospaced()).foregroundStyle(.secondary)
+                TableColumn("Source", value: \.source) { row in
+                    Text(row.source)
+                        .foregroundStyle(row.template.archive == nil && !row.template.isOverride ? .secondary : .primary)
+                        .help(row.template.archive.map { "Found only in the module \($0.lastPathComponent), not in the game’s item files" }
+                            ?? (row.template.isOverride ? "From the override folder" : "From the game’s item files"))
                 }
-                .width(min: 90, ideal: 150)
-                TableColumn("ResRef", value: \.resRef) { template in
-                    Text(template.resRef).font(.callout.monospaced()).foregroundStyle(.secondary)
+                .width(min: 60, ideal: 85)
+                TableColumn("Tag", value: \.tag) { row in
+                    Text(row.tag).font(.callout.monospaced()).foregroundStyle(.secondary)
                 }
-                .width(min: 90, ideal: 140)
+                .width(min: 80, ideal: 130)
+                TableColumn("ResRef", value: \.resRef) { row in
+                    Text(row.resRef).font(.callout.monospaced()).foregroundStyle(.secondary)
+                }
+                .width(min: 80, ideal: 120)
             }
             .contextMenu(forSelectionType: String.self) { _ in } primaryAction: { ids in
                 confirm(ids)
@@ -197,9 +220,12 @@ struct ItemPickerSheet: View {
                 }
             }
         }
-        .frame(width: 760, height: 640)
+        .frame(width: 900, height: 640)
         .task {
-            templates = await gameData.assets.itemTemplates()
+            rows = await gameData.assets.itemTemplates().map { template in
+                TemplateRow(template: template, name: template.name.isEmpty ? template.resRef : tokens.apply(template.name),
+                            type: gameData.baseItemName(template.baseItem))
+            }
             loading = false
         }
     }
@@ -212,14 +238,14 @@ struct ItemPickerSheet: View {
     }
 
     private func confirm(_ ids: Set<String>) {
-        let chosen = templates.filter { ids.contains($0.resRef) }
+        let chosen = rows.filter { ids.contains($0.id) }.map(\.template)
         guard !chosen.isEmpty else { return }
         add(chosen, quantity)
     }
 
-    private func describe(_ resRef: String) -> String? {
-        guard let root = gameData.itemTemplate(resRef)?.root else { return nil }
-        return gameData.text(root.locString("DescIdentified")) ?? gameData.text(root.locString("Description"))
+    private func describe(_ id: String) -> String? {
+        guard let template = rows.first(where: { $0.id == id })?.template, let root = gameData.itemTemplate(template)?.root else { return nil }
+        return (gameData.text(root.locString("DescIdentified")) ?? gameData.text(root.locString("Description"))).map(tokens.apply)
     }
 }
 
@@ -228,9 +254,17 @@ struct InventoryView: View {
     let document: SaveDocument
 
     @State private var selection = Set<Int>()
-    @State private var adding = false
+    @State private var adding = Self.opensItemPicker
     @State private var search = ""
     @State private var confirmPaste = false
+
+    private static var opensItemPicker: Bool {
+        #if DEBUG
+        UserDefaults.standard.string(forKey: "KSEMacPicker") == "items"
+        #else
+        false
+        #endif
+    }
     @State private var sortOrder = [KeyPathComparator(\InventoryRow.name)]
 
     nonisolated struct InventoryRow: Identifiable, Sendable {
@@ -244,10 +278,11 @@ struct InventoryView: View {
 
     var body: some View {
         let data = document.gameData
+        let tokens = document.textTokens
         let rows = (document.save?.inventoryItems ?? []).map { item in
-            InventoryRow(item: item, name: data?.text(item.name) ?? item.tag, type: data?.baseItemName(item.baseItem) ?? "\(item.baseItem)")
+            InventoryRow(item: item, name: tokens.apply(data?.text(item.name) ?? item.tag), type: data?.baseItemName(item.baseItem) ?? "\(item.baseItem)")
         }
-        let visible = rows.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.tag.localizedCaseInsensitiveContains(search) }
+        let visible = rows.filter { SearchText.matches(search, $0.name, $0.type, $0.tag) }
             .sorted(using: sortOrder)
         VStack(alignment: .leading, spacing: 10) {
             HStack {
@@ -302,8 +337,8 @@ struct InventoryView: View {
         .padding(20)
         .sheet(isPresented: $adding) {
             if let data {
-                ItemPickerSheet(mode: .inventory, gameData: data, owned: Set(rows.map { $0.tag.lowercased() })) { templates, count in
-                    let documents = templates.compactMap { template in data.itemTemplate(template.resRef) }
+                ItemPickerSheet(mode: .inventory, gameData: data, tokens: tokens, owned: Set(rows.map { $0.tag.lowercased() })) { templates, count in
+                    let documents = templates.compactMap { template in data.itemTemplate(template) }
                     document.edit(documents.count == 1 ? "Add Item" : "Add Items") { save in
                         for template in documents {
                             let limit = data.baseItems[template.root.integer("BaseItem") ?? -1]?.stacking ?? 1

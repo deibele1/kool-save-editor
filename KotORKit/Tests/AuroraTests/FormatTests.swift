@@ -144,6 +144,28 @@ struct ERFTests {
         #expect(index.data(for: "po_test", type: .tga) == nil)
     }
 
+    @Test func rimAndERFIndexesListAndReadTheirResources() throws {
+        let folder = try temporaryDirectory()
+        let rim = folder.appendingPathComponent("101PER_s.rim")
+        try Data(rimFile([("G_W_Unique", .uti, [1, 2, 3]), ("module", .ifo, [4]), ("empty", .uti, [])])).write(to: rim)
+        let index = try openArchiveIndex(at: rim)
+        #expect(index is RIMIndex)
+        #expect(index.entries == [ArchiveEntry(resRef: "g_w_unique", type: .uti), ArchiveEntry(resRef: "module", type: .ifo),
+                                  ArchiveEntry(resRef: "empty", type: .uti)])
+        #expect(index.data(for: "g_w_UNIQUE", type: .uti) == [1, 2, 3] && index.data(for: "empty", type: .uti) == [])
+        #expect(index.data(for: "module", type: .uti) == nil)
+
+        let erf = folder.appendingPathComponent("mod.mod")
+        try Data(ERFArchive(fileType: "MOD ", resources: [.init(resRef: "Other", type: .uti, resID: 0, data: [9])]).encoded()).write(to: erf)
+        let mod = try openArchiveIndex(at: erf)
+        #expect(mod is ERFIndex && mod.entries == [ArchiveEntry(resRef: "other", type: .uti)] && mod.data(for: "other", type: .uti) == [9])
+
+        var broken = rimFile([("a", .uti, [1])])
+        broken[12] = 0xFF
+        #expect(throws: (any Error).self) { try RIMIndex(data: Data(broken)) }
+        #expect(throws: (any Error).self) { try RIMIndex(data: Data(Array("RIM V2.0".utf8) + [UInt8](repeating: 0, count: 12))) }
+    }
+
     @Test func rejectsTablesOutsideTheFile() {
         var bytes = ERFArchive(fileType: "ERF ", resources: [.init(resRef: "a", type: .res, resID: 0, data: [1])]).encoded()
         bytes[16] = 0xFF
@@ -164,6 +186,14 @@ struct TableTests {
         #expect(table.string(2, "label") == nil)
         #expect(table.string(9, "label") == nil)
         #expect(table.string(0, "missing") == nil)
+    }
+
+    @Test func binaryTwoDAIgnoresTheStoredDataSize() throws {
+        // Modding tools have shipped soundset.2da files that store a data size of 0.
+        let table = try TwoDA(bytes: binary2DA(columns: ["label", "resref"], rows: [["None", ""], ["Player_Female_W", "p_playerfw"]],
+                                               storedDataSize: 0))
+        #expect(table.string(1, "label") == "Player_Female_W" && table.string(1, "resref") == "p_playerfw")
+        #expect(table.string(0, "resref") == nil)
     }
 
     @Test func textTwoDAHandlesDefaultsAndQuotes() throws {
@@ -187,6 +217,15 @@ struct TableTests {
         #expect(polish.string(0) == "Zażółć")
     }
 
+    @Test func talkTableEntriesNameTheirSounds() throws {
+        var bytes = talkTable(["Yeah?", "No sound", "Flag cleared"], sounds: [0: "p_Atton_Slct1", 2: "p_atton_slct2"])
+        bytes[20 + 2 * 40] &= ~2
+        let tlk = try TalkTable(data: Data(bytes))
+        #expect(tlk.soundResRef(0) == "p_Atton_Slct1")
+        #expect(tlk.soundResRef(1) == nil && tlk.soundResRef(2) == nil)
+        #expect(tlk.soundResRef(3) == nil && tlk.soundResRef(GFFLocString.noStringRef) == nil)
+    }
+
     @Test func keyAndBIFResolveCaseInsensitively() throws {
         let root = try temporaryDirectory()
         try FileManager.default.createDirectory(at: root.appendingPathComponent("Data"), withIntermediateDirectories: true)
@@ -198,6 +237,34 @@ struct TableTests {
         #expect(try archive.resource("feat", .uti) == [9, 9])
         #expect(try archive.resource("spells", .twoDA) == nil)
         #expect(archive.entries(of: .uti).map(\.resRef) == ["feat"])
+    }
+}
+
+struct SoundTests {
+    @Test func soundSetsListTalkTableReferences() throws {
+        let set = try SoundSetFile(bytes: soundSetFile([122_703, GFFLocString.noStringRef, 7]))
+        #expect(set.strRefs == [122_703, GFFLocString.noStringRef, 7])
+        #expect(throws: (any Error).self) { try SoundSetFile(bytes: Array("SSF V1.0".utf8) + [12, 0, 0, 0]) }
+        #expect(throws: (any Error).self) { try SoundSetFile(bytes: Array("SSF V1.1".utf8) + [200, 0, 0, 0]) }
+        #expect(throws: (any Error).self) { try SoundSetFile(bytes: Array("SSF V1.1".utf8)) }
+    }
+
+    @Test func soundContainersAreUnwrapped() throws {
+        let wave = waveFile([0, 100, -100, 32767])
+        let plain = try #require(GameSound.playable(wave))
+        #expect(plain.bytes == wave && plain.format == .wave)
+
+        let stream = try #require(GameSound.playable(streamSoundFile([0, 100, -100, 32767])))
+        #expect(stream.bytes == wave && stream.format == .wave)
+
+        let mp3: [UInt8] = [0xFF, 0xFB, 0x38, 0xC4, 1, 2, 3]
+        let voice = try #require(GameSound.playable(voiceOverFile(mp3)))
+        #expect(voice.bytes == mp3 && voice.format == .mp3)
+        #expect(GameSound.playable(mp3)?.format == .mp3)
+        #expect(GameSound.playable(Array("ID3".utf8) + mp3)?.format == .mp3)
+
+        #expect(GameSound.playable(Array("RIFF\0\0\0\0WAVE".utf8)) == nil)
+        #expect(GameSound.playable([1, 2, 3, 4]) == nil)
     }
 }
 

@@ -10,13 +10,14 @@ struct JournalView: View {
     var body: some View {
         let data = document.gameData
         let entries = document.save?.journalEntries ?? []
+        let tokens = document.textTokens
         HSplitView {
             VStack(alignment: .leading, spacing: 10) {
                 List(entries, selection: $selection) { entry in
                     let quest = data?.quests[entry.id]
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(quest?.name ?? entry.plotID)
-                        Text(stateTitle(entry, quest)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(tokens.apply(quest?.name ?? entry.plotID))
+                        Text(tokens.apply(stateTitle(entry, quest))).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     .tag(entry.id)
                 }
@@ -44,7 +45,7 @@ struct JournalView: View {
             .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
         }
         .sheet(isPresented: $adding) {
-            QuestPickerSheet(quests: Array((data?.quests ?? [:]).values), known: Set(entries.map(\.id))) { quests in
+            QuestPickerSheet(quests: Array((data?.quests ?? [:]).values), known: Set(entries.map(\.id)), tokens: tokens) { quests in
                 document.edit(quests.count == 1 ? "Add Quest" : "Add Quests") { save in
                     for quest in quests { save.addQuest(quest.tag, state: quest.entries.first?.id ?? 10) }
                 }
@@ -70,16 +71,17 @@ struct QuestDetail: View {
     let quest: QuestInfo?
 
     var body: some View {
+        let tokens = document.textTokens
         Form {
             Section {
-                LabeledContent("Quest", value: quest?.name ?? entry.plotID)
+                LabeledContent("Quest", value: tokens.apply(quest?.name ?? entry.plotID))
                 LabeledContent("Plot ID", value: entry.plotID)
                 if let quest, !quest.entries.isEmpty {
                     Picker("State", selection: document.binding("Change Quest State",
                                                                 { $0.journalEntries.first { $0.id == entry.id }?.state ?? entry.state },
                                                                 { $0.setQuestState(entry.plotID, $1) })) {
                         ForEach(stateChoices(quest)) { state in
-                            Text(label(state)).tag(state.id)
+                            Text(label(state, tokens)).tag(state.id)
                         }
                     }
                 } else {
@@ -91,7 +93,7 @@ struct QuestDetail: View {
             }
             if let text = quest?.entries.first(where: { $0.id == entry.state })?.text, !text.isEmpty {
                 Section("Journal Entry") {
-                    Text(text).textSelection(.enabled)
+                    Text(tokens.apply(text)).textSelection(.enabled)
                 }
             }
         }
@@ -106,8 +108,9 @@ struct QuestDetail: View {
         return choices.sorted { $0.id < $1.id }
     }
 
-    private func label(_ state: QuestInfo.Entry) -> String {
-        let text = state.text.count > 70 ? state.text.prefix(67) + "…" : state.text
+    private func label(_ state: QuestInfo.Entry, _ tokens: TextTokens) -> String {
+        let full = tokens.apply(state.text)
+        let text = full.count > 70 ? full.prefix(67) + "…" : full
         return "\(state.id)\(state.isEnd ? " (end)" : "")" + (text.isEmpty ? "" : " — \(text)")
     }
 }
@@ -115,14 +118,15 @@ struct QuestDetail: View {
 struct QuestPickerSheet: View {
     let quests: [QuestInfo]
     let known: Set<String>
+    let tokens: TextTokens
     let add: ([QuestInfo]) -> Void
 
     @State private var selection = Set<String>()
     @State private var search = ""
 
     private var visible: [QuestInfo] {
-        quests.filter { search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.tag.localizedCaseInsensitiveContains(search) }
-            .sorted { $0.name.localizedLowercase < $1.name.localizedLowercase }
+        quests.filter { SearchText.matches(search, tokens.apply($0.name), $0.tag) }
+            .sorted { tokens.apply($0.name).localizedLowercase < tokens.apply($1.name).localizedLowercase }
     }
 
     var body: some View {
@@ -135,7 +139,7 @@ struct QuestPickerSheet: View {
             List(visible, selection: $selection) { quest in
                 HStack {
                     VStack(alignment: .leading) {
-                        Text(quest.name)
+                        Text(tokens.apply(quest.name))
                         Text(quest.tag).font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()

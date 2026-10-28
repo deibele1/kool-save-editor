@@ -4,7 +4,8 @@
 // GNU GPL v3 or later.
 //
 // Differences from the C++ original: the file is memory mapped and entries are decoded
-// on demand; V4 (Jade Empire/Witcher) and GFF-based talk tables are not supported.
+// on demand; V4 (Jade Empire/Witcher) and GFF-based talk tables are not supported; volume
+// and pitch variance and sound lengths are not read.
 
 import Foundation
 
@@ -47,6 +48,17 @@ public final class TalkTable: Sendable {
         guard length > 0, offset >= 0, offset <= data.count, length <= data.count - offset else { return nil }
         let start = data.startIndex + offset
         return encoding.decode(data[start ..< start + length])
+    }
+
+    /// The sound (a WAV resource name) spoken with an entry, or nil when it has none. As in
+    /// BioWare's specification, the name only counts when the entry's sound flag (2) is set.
+    public func soundResRef(_ strRef: UInt32) -> String? {
+        guard strRef != GFFLocString.noStringRef, Int(strRef) < count else { return nil }
+        let entry = Self.headerSize + Int(strRef) * Self.entrySize
+        guard uint32(entry) & 2 != 0 else { return nil }
+        let start = data.startIndex + entry + 4
+        let name = data[start ..< start + 16].prefix { $0 != 0 }
+        return name.isEmpty ? nil : String(decoding: name, as: UTF8.self)
     }
 
     private func uint32(_ position: Int) -> UInt32 {

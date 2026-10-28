@@ -6,7 +6,9 @@ import SwiftUI
 
 struct LocationState {
     var summaries: [SaveSummary] = []
+    /// Why the folder can't be read, short enough for the sidebar; `errorHelp` has the details.
     var error: String?
+    var errorHelp: String?
     var isLoading = false
 }
 
@@ -95,7 +97,10 @@ final class AppModel {
             var state = LocationState()
             switch result {
             case .success(let summaries): state.summaries = summaries
-            case .failure(let error): state.error = Self.describe(error, at: location.url)
+            case .failure(let error):
+                let problem = Self.describe(error, at: location.url)
+                state.error = problem.message
+                state.errorHelp = problem.help
             }
             locationStates[location.id] = state
             for summary in state.summaries { documents[summary.id]?.summary = summary }
@@ -126,12 +131,14 @@ final class AppModel {
     }
     #endif
 
-    static func describe(_ error: Error, at url: URL) -> String {
+    /// A short message for the sidebar and the details for its tooltip.
+    static func describe(_ error: Error, at url: URL) -> (message: String, help: String) {
         let nsError = error as NSError
         if nsError.domain == NSCocoaErrorDomain, nsError.code == NSFileReadNoPermissionError {
-            return "macOS blocked access to this folder. Allow Kool Save Editor to access data from other apps in System Settings › Privacy & Security, then refresh."
+            return ("Access blocked by macOS",
+                    "Allow Kool Save Editor to access data from other apps in System Settings › Privacy & Security, then refresh the save list.")
         }
-        return error.localizedDescription
+        return ("Can’t read this folder", error.localizedDescription)
     }
 
     func location(for id: String) -> (SaveSummary, SaveLocation)? {

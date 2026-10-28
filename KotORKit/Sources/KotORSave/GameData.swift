@@ -5,7 +5,9 @@
 //
 // Unlike KSE, lookups go through chitin.key instead of hard-coded BIF names, every table
 // may be overridden from the override folder, and a missing installation degrades to
-// numeric labels instead of aborting.
+// numeric labels instead of aborting. Additions: voice sets are named from the talk table,
+// include the player's (which TSL's soundset.2da lacks) and can be heard; appearances are
+// matched to the portrait showing their face.
 
 import Aurora
 import Foundation
@@ -55,6 +57,71 @@ public struct QuestInfo: Sendable, Hashable, Identifiable {
     public var id: String { tag }
 }
 
+/// A voice set (soundset.2da row): the sound set file a creature's battle cries, grunts and
+/// remarks come from.
+public struct SoundsetInfo: Sendable, Hashable, Identifiable {
+    public var id: Int
+    public var name: String
+    /// The sound set file (SSF); nil for rows without one, such as "None".
+    public var resRef: String?
+    /// The gender.2da value (0 male, 1 female) when the table gives one.
+    public var gender: Int?
+    /// One of the rows the games give the player character (see `GameData.playerSoundsets`).
+    public var isPlayer: Bool
+    /// Whether this installation has the sound set file, i.e. whether the voice is heard.
+    public var hasSounds: Bool
+    /// False for player voice sets the game's soundset.2da lacks.
+    public var isInTable: Bool
+
+    /// A companion's voice: the games name their sound sets p_<name>.
+    public var isPartyMember: Bool { !isPlayer && resRef?.lowercased().hasPrefix("p_") == true }
+}
+
+/// One line of a voice set, ready to play.
+public struct VoiceSample: Sendable {
+    /// The sound set slot, see `slotName`.
+    public var slot: Int
+    public var strRef: UInt32
+    /// The words spoken, when the talk table has them (grunts have none).
+    public var text: String?
+    public var audio: [UInt8]
+    public var format: GameSound.Format
+
+    public var slotName: String { Self.slotNames[safe: slot] ?? "Sound \(slot + 1)" }
+
+    /// What KotOR's 28 sound set slots are for.
+    public static let slotNames = [
+        "Battle cry", "Battle cry", "Battle cry", "Battle cry", "Battle cry", "Battle cry", "Selected", "Selected", "Selected",
+        "Attack grunt", "Attack grunt", "Attack grunt", "Pain grunt", "Pain grunt", "Low on health", "Knocked out",
+        "Critical hit", "Target immune", "Laying a mine", "Disarming a mine", "Stealth", "Searching", "Opening a lock",
+        "Lock won’t open", "Lock opened", "Going alone", "Rejoining the party", "Poisoned",
+    ]
+}
+
+/// The tokens the games fill in when they show text: the player's name, which TSL puts in item
+/// names ("<FullName> Crystal"), descriptions and journal entries. Tokens set while playing
+/// (<CUSTOM0>, controller buttons) are left as they are.
+public struct TextTokens: Sendable, Equatable {
+    public var firstName: String
+    public var lastName: String
+
+    public init(firstName: String, lastName: String = "") {
+        self.firstName = firstName
+        self.lastName = lastName
+    }
+
+    public var fullName: String { [firstName, lastName].filter { !$0.isEmpty }.joined(separator: " ") }
+
+    public func apply(_ text: String) -> String {
+        guard text.contains("<"), !fullName.isEmpty else { return text }
+        var result = text
+        for (token, value) in [("<FullName>", fullName), ("<PlayerName>", fullName), ("<FirstName>", firstName), ("<LastName>", lastName)] {
+            result = result.replacingOccurrences(of: token, with: value, options: .caseInsensitive)
+        }
+        return result
+    }
+}
+
 public struct ItemTemplate: Sendable, Hashable, Identifiable {
     public var resRef: String
     public var tag: String
@@ -62,7 +129,20 @@ public struct ItemTemplate: Sendable, Hashable, Identifiable {
     public var baseItem: Int
     public var modelVariation: Int
     public var isOverride: Bool
-    public var id: String { resRef }
+    /// A quest item (the blueprint's plot flag).
+    public var isPlot: Bool
+    /// The level file (RIM, MOD or ERF) holding the blueprint, for items that aren't in the BIFs
+    /// or override folder in this form.
+    public var archive: URL?
+
+    /// The level the blueprint comes from, e.g. 401DXN for Modules/401DXN_s.rim.
+    public var module: String? {
+        guard let name = archive?.deletingPathExtension().lastPathComponent else { return nil }
+        return name.lowercased().hasSuffix("_s") ? String(name.dropLast(2)) : name
+    }
+
+    /// Level files may reuse a BIF item's name for a different item.
+    public var id: String { archive.map { "\(resRef)@\($0.lastPathComponent)" } ?? resRef }
 }
 
 public final class GameData: Sendable {
@@ -73,8 +153,10 @@ public final class GameData: Sendable {
     public let problem: String?
 
     public let appearances: [Int: String]
+    /// The portrait showing each appearance's face, where the game has one.
+    public let appearancePortraits: [Int: String]
     public let portraits: [Int: String]
-    public let soundsets: [Int: String]
+    public let soundsets: [Int: SoundsetInfo]
     public let genders: [Int: String]
     public let skills: [Int: String]
     public let classes: [Int: ClassInfo]
@@ -123,8 +205,9 @@ public final class GameData: Sendable {
 
         let loader = TableLoader(key: key, overrides: overrides, talk: talk)
         appearances = loader.labels("appearance", column: "label")
+        appearancePortraits = loader.appearancePortraits(labels: appearances)
         portraits = loader.labels("portraits", column: "baseresref")
-        soundsets = loader.labels("soundset", column: "label")
+        soundsets = loader.soundsets()
         genders = loader.genders()
         skills = loader.names("skills")
         classes = loader.classes()
@@ -139,11 +222,24 @@ public final class GameData: Sendable {
         talkTable?.string(strRef)
     }
 
-    /// The text of a localized string: inline text first, then the talk table.
+    /// The text of a localized string as the game shows it: inline text first, then the talk
+    /// table, without {notes}.
     public func text(_ loc: GFFLocString?) -> String? {
         guard let loc else { return nil }
-        if let inline = loc.text(encoding: encoding, languageID: languageID * 2), !inline.isEmpty { return inline }
-        return loc.hasStringRef ? string(loc.stringRef) : nil
+        let raw: String?
+        if let inline = loc.text(encoding: encoding, languageID: languageID * 2), !inline.isEmpty {
+            raw = inline
+        } else {
+            raw = loc.hasStringRef ? string(loc.stringRef) : nil
+        }
+        return raw.map(Self.displayed).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// Text as the games show it: they hide notes in {curly braces}, such as the {02} in TSL's
+    /// "{02}Padawan Robe" or the voice directions in dialog lines.
+    public static func displayed(_ text: String) -> String {
+        guard text.contains("{") else { return text }
+        return text.replacingOccurrences(of: #"\{[^}]*\}"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
     }
 
     /// Looks a resource up in the override folder, then in the BIF archives.
@@ -155,9 +251,16 @@ public final class GameData: Sendable {
         resource(resRef, .uti).flatMap { try? GFFDocument(bytes: $0) }
     }
 
+    /// The full blueprint of a catalog entry, read from its level file when it has one.
+    public func itemTemplate(_ template: ItemTemplate) -> GFFDocument? {
+        guard let archive = template.archive else { return itemTemplate(template.resRef) }
+        return (try? openArchiveIndex(at: archive))?.data(for: template.resRef, type: .uti).flatMap { try? GFFDocument(bytes: $0) }
+    }
+
     public func appearanceName(_ id: Int) -> String { appearances[id] ?? "Appearance \(id)" }
     public func portraitName(_ id: Int) -> String { portraits[id] ?? "Portrait \(id)" }
-    public func soundsetName(_ id: Int) -> String { id == 0xFFFF ? "None" : soundsets[id] ?? "Soundset \(id)" }
+    /// 0xFFFF means no voice set at all; soundset.2da has a separate "None" row.
+    public func soundsetName(_ id: Int) -> String { id == 0xFFFF ? "Not set" : soundsets[id]?.name ?? "Voice set \(id)" }
     public func genderName(_ id: Int) -> String { genders[id] ?? "Gender \(id)" }
     public func skillName(_ id: Int) -> String { skills[id] ?? Self.defaultSkills[safe: id] ?? "Skill \(id)" }
     public func className(_ id: Int) -> String { classes[id]?.name ?? "Class \(id)" }
@@ -172,6 +275,46 @@ public final class GameData: Sendable {
     }
 
     static let defaultSkills = ["Computer Use", "Demolitions", "Stealth", "Awareness", "Persuade", "Repair", "Security", "Treat Injury"]
+
+    /// The voice sets the games give the player character at creation, by gender: KotOR's
+    /// Player_Female_W and Player_Male_W rows. The Sith Lords assigns the same rows, but its
+    /// soundset.2da stops at row 65, so its player is silent unless a mod adds them back.
+    public static let playerSoundsets: [Int: (name: String, gender: Int)] = [83: ("Player - Female", 1), 85: ("Player - Male", 0)]
+
+    /// A random line of a voice set whose sound this installation has; `previous` makes a
+    /// different line likelier. Nil when the voice set has no sounds.
+    public func randomVoiceSample(soundset id: Int, after previous: VoiceSample? = nil) -> VoiceSample? {
+        guard let resRef = soundsets[id]?.resRef, let bytes = resource(resRef, .ssf),
+              let set = try? SoundSetFile(bytes: bytes) else { return nil }
+        let slots = set.strRefs.prefix(VoiceSample.slotNames.count).enumerated()
+            .filter { $0.element != GFFLocString.noStringRef }.shuffled()
+        let fresh = slots.filter { $0.element != previous?.strRef }
+        for (slot, strRef) in fresh + slots.filter({ $0.element == previous?.strRef }) {
+            guard let name = talkTable?.soundResRef(strRef), let file = sound(name), let audio = GameSound.playable(file) else { continue }
+            return VoiceSample(slot: slot, strRef: strRef, text: Self.spokenText(string(strRef)), audio: audio.bytes, format: audio.format)
+        }
+        return nil
+    }
+
+    /// A sound file by name: the override folder, the stream folders, then the BIF archives.
+    func sound(_ name: String) -> [UInt8]? {
+        let fm = FileManager.default
+        let streams = ["StreamSounds", "StreamWaves", "StreamVoice"].compactMap { folder in root.flatMap { fm.caseInsensitiveItem(named: folder, in: $0) } }
+        for folder in [overrideFolder].compactMap({ $0 }) + streams {
+            if let url = fm.caseInsensitiveItem(named: "\(name).wav", in: folder), let data = try? Data(contentsOf: url) { return [UInt8](data) }
+        }
+        return (try? keyArchive?.resource(name, .wav)) ?? nil
+    }
+
+    /// The words of a sound set line. Talk table entries put directions in {braces}; grunts
+    /// and placeholders are described in ::colons:: or carry translator notes.
+    static func spokenText(_ text: String?) -> String? {
+        guard let text else { return nil }
+        let words = text.replacingOccurrences(of: #"\{[^}]*\}"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isDescription = words.contains("::") || ["translate", "grunt"].contains { words.localizedCaseInsensitiveContains($0) }
+        return words.isEmpty || isDescription ? nil : words
+    }
 }
 
 extension Array {
@@ -191,12 +334,17 @@ struct TableLoader {
         return (try? key?.resource(resRef, type)) ?? nil
     }
 
+    func contains(_ resRef: String, _ type: ResourceType) -> Bool {
+        if key?.contains(resRef, type) == true { return true }
+        return overrides.flatMap { FileManager.default.caseInsensitiveItem(named: "\(resRef).\(type.fileExtension)", in: $0) } != nil
+    }
+
     func table(_ name: String) -> TwoDA? {
         resource(name, .twoDA).flatMap { try? TwoDA(bytes: $0) }
     }
 
     func string(_ cell: String?) -> String? {
-        guard let cell, let ref = UInt32(cell), let text = talk?.string(ref), !text.isEmpty else { return nil }
+        guard let cell, let ref = UInt32(cell), let text = talk?.string(ref).map(GameData.displayed), !text.isEmpty else { return nil }
         return text
     }
 
@@ -214,6 +362,62 @@ struct TableLoader {
         var result: [Int: String] = [:]
         for row in 0 ..< table.rowCount {
             if let text = string(table.string(row, "name")) ?? table.string(row, "label") { result[row] = text }
+        }
+        return result
+    }
+
+    /// The portrait showing each appearance's face. portraits.2da names each portrait's
+    /// appearances (normal, small and large body); normal bodies are matched first, then the
+    /// first portrait wins. Leftovers are matched by name: party appearances to po_p<name> (TSL
+    /// lists Bao-Dur's portrait under Atton's appearance and has none for variants such as
+    /// Party_NPC_Kreia_Gimped), player bodies to the same body in another size (TSL leaves out
+    /// P_MAL_H_LRG_02).
+    func appearancePortraits(labels: [Int: String]) -> [Int: String] {
+        guard let table = table("portraits") else { return [:] }
+        var result: [Int: String] = [:]
+        for column in ["appearancenumber", "appearance_s", "appearance_l"] {
+            for row in 0 ..< table.rowCount {
+                guard let id = table.int(row, column), result[id] == nil, let portrait = table.string(row, "baseresref") else { continue }
+                result[id] = portrait
+            }
+        }
+        let names = (0 ..< table.rowCount).compactMap { table.string($0, "baseresref") }
+        let byName = Dictionary(names.map { ($0.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
+        let byLabel = Dictionary(labels.map { ($0.value.lowercased(), $0.key) }, uniquingKeysWith: { first, _ in first })
+        let sizes = ["_med_", "_sml_", "_lrg_"]
+        for (id, label) in labels.sorted(by: { $0.key < $1.key }) where result[id] == nil {
+            let lower = label.lowercased()
+            let parts = lower.split(separator: "_")
+            if parts.count > 2, parts[0] == "party", parts[1] == "npc" {
+                result[id] = byName["po_p\(parts[2])"]
+            } else if let size = sizes.first(where: lower.contains) {
+                let siblings = sizes.compactMap { byLabel[lower.replacingOccurrences(of: size, with: $0)] }
+                let face = siblings.compactMap { result[$0] }.first
+                result[id] = face
+            }
+        }
+        return result
+    }
+
+    /// Voice sets, named by the talk table (without its "**Do Not Translate This**" notes) or
+    /// their label, plus the player voice sets when the table lacks them.
+    func soundsets() -> [Int: SoundsetInfo] {
+        guard let table = table("soundset") else { return [:] }
+        var result: [Int: SoundsetInfo] = [:]
+        for row in 0 ..< table.rowCount {
+            let spoken = string(table.string(row, "strref")).map {
+                $0.replacingOccurrences(of: #"\*\*[^*]*\*\*"#, with: "", options: .regularExpression)
+                    .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            }
+            guard let name = spoken.flatMap({ $0.isEmpty ? nil : $0 }) ?? table.string(row, "label") else { continue }
+            let resRef = table.string(row, "resref")
+            result[row] = SoundsetInfo(id: row, name: name, resRef: resRef, gender: table.int(row, "gender"),
+                                       isPlayer: GameData.playerSoundsets[row] != nil || resRef?.lowercased().hasPrefix("p_player") == true,
+                                       hasSounds: resRef.map { contains($0, .ssf) } ?? false, isInTable: true)
+        }
+        for (id, player) in GameData.playerSoundsets where result[id] == nil && !result.isEmpty {
+            result[id] = SoundsetInfo(id: id, name: player.name, resRef: nil, gender: player.gender, isPlayer: true,
+                                      hasSounds: false, isInTable: false)
         }
         return result
     }
@@ -259,7 +463,8 @@ struct TableLoader {
             guard let label = table.string(row, "label") else { continue }
             let ranged = table.columnIndex("rangedweapon") != nil ? table.string(row, "rangedweapon") != nil
                 : (table.int(row, "weapontype") ?? 1) != 1
-            result[row] = BaseItemInfo(id: row, name: string(table.string(row, "name")) ?? label,
+            // Rows without a talk table name show their label, e.g. KotOR's Revan_Armor.
+            result[row] = BaseItemInfo(id: row, name: string(table.string(row, "name")) ?? label.replacingOccurrences(of: "_", with: " "),
                                        itemClass: table.string(row, "itemclass") ?? "",
                                        equipableSlots: table.int(row, "equipableslots") ?? 0,
                                        droidOrHuman: table.int(row, "droidorhuman") ?? 0,
@@ -274,8 +479,8 @@ struct TableLoader {
         let language = (talk?.languageID ?? 0) * 2
         func text(_ loc: GFFLocString?) -> String? {
             guard let loc else { return nil }
-            if let inline = loc.text(encoding: encoding, languageID: language), !inline.isEmpty { return inline }
-            return loc.hasStringRef ? talk?.string(loc.stringRef) : nil
+            if let inline = loc.text(encoding: encoding, languageID: language), !inline.isEmpty { return GameData.displayed(inline) }
+            return loc.hasStringRef ? talk?.string(loc.stringRef).map(GameData.displayed) : nil
         }
         var result: [String: QuestInfo] = [:]
         for category in categories {
@@ -337,35 +542,72 @@ public actor GameAssets {
         return index
     }
 
-    /// Every item blueprint in the game (templates BIF) and override folder.
+    /// Every item blueprint: the BIFs, the override folder (which replaces BIF blueprints of
+    /// the same name) and the level files, which hold the unique items found in one place and
+    /// sometimes reuse a name for a different item. Copies that are the same item to a player
+    /// are listed once (see `signature`).
     public func itemTemplates() -> [ItemTemplate] {
         if let templates { return templates }
-        var byResRef: [String: ItemTemplate] = [:]
-        func add(_ resRef: String, _ bytes: [UInt8], override: Bool) {
-            guard let gff = try? GFFDocument(bytes: bytes) else { return }
-            let root = gff.root
+        typealias Parsed = (template: ItemTemplate, signature: String)
+        func parse(_ resRef: String, _ bytes: [UInt8], override: Bool = false, archive: URL? = nil) -> Parsed? {
+            guard let document = try? GFFDocument(bytes: bytes) else { return nil }
+            let root = document.root
             let loc = root.locString("LocalizedName")
             var name = loc?.text(encoding: encoding, languageID: (talk?.languageID ?? 0) * 2) ?? ""
             if name.isEmpty, let loc, loc.hasStringRef { name = talk?.string(loc.stringRef) ?? "" }
-            byResRef[resRef.lowercased()] = ItemTemplate(
-                resRef: resRef.lowercased(), tag: root.string("Tag", encoding: encoding) ?? "", name: name,
-                baseItem: root.integer("BaseItem") ?? 0,
-                modelVariation: root.integer("ModelVariation") ?? root.integer("TextureVar") ?? 0, isOverride: override)
+            name = GameData.displayed(name)
+            let template = ItemTemplate(resRef: resRef.lowercased(), tag: root.string("Tag", encoding: encoding) ?? "", name: name,
+                                        baseItem: root.integer("BaseItem") ?? 0,
+                                        modelVariation: root.integer("ModelVariation") ?? root.integer("TextureVar") ?? 0,
+                                        isOverride: override, isPlot: (root.integer("Plot") ?? 0) != 0, archive: archive)
+            return (template, Self.signature(root, name: name))
         }
+        var global: [String: Parsed] = [:]
         if let key {
             for entry in key.entries(of: .uti) {
-                if let bytes = try? key.resource(entry.resRef, .uti) { add(entry.resRef, bytes, override: false) }
+                if let bytes = try? key.resource(entry.resRef, .uti), let parsed = parse(entry.resRef, bytes) { global[parsed.template.resRef] = parsed }
             }
         }
         if let overrides, let files = try? FileManager.default.contentsOfDirectory(at: overrides, includingPropertiesForKeys: nil) {
             for file in files where file.pathExtension.lowercased() == "uti" {
-                if let data = try? Data(contentsOf: file) {
-                    add(file.deletingPathExtension().lastPathComponent, [UInt8](data), override: true)
+                if let data = try? Data(contentsOf: file), let parsed = parse(file.deletingPathExtension().lastPathComponent, [UInt8](data), override: true) {
+                    global[parsed.template.resRef] = parsed
                 }
             }
         }
-        let sorted = byResRef.values.sorted { $0.resRef < $1.resRef }
+        var found = global.values.map(\.template)
+        var signatures = Set(global.values.map(\.signature))
+        for archive in levelArchives() {
+            guard let index = try? openArchiveIndex(at: archive) else { continue }
+            for entry in index.entries where entry.type == .uti {
+                guard let bytes = index.data(for: entry.resRef, type: .uti), let parsed = parse(entry.resRef, bytes, archive: archive),
+                      signatures.insert(parsed.signature).inserted else { continue }
+                found.append(parsed.template)
+            }
+        }
+        let sorted = found.sorted { ($0.resRef, $0.archive == nil ? "" : $0.id) < ($1.resRef, $1.archive == nil ? "" : $1.id) }
         templates = sorted
         return sorted
+    }
+
+    /// What makes two blueprints the same item to a player: the displayed name, the tag and
+    /// every field except price, descriptions, the plot, stolen and identified flags, stack size
+    /// and developer notes. Level files carry many copies differing only in those.
+    static func signature(_ root: GFFStruct, name: String) -> String {
+        let ignored: Set<String> = ["LocalizedName", "Description", "DescIdentified", "Tag", "TemplateResRef", "Cost", "AddCost",
+                                    "Plot", "Stolen", "Identified", "StackSize", "Comment", "PaletteID"]
+        let fields = root.fields.filter { !ignored.contains($0.label) }.sorted { $0.label < $1.label }.map { "\($0.label)=\($0.value)" }
+        return ([name.lowercased(), (root.string("Tag") ?? "").lowercased()] + fields).joined(separator: "\u{1F}")
+    }
+
+    /// The level files: Modules/ (RIM, MOD and ERF) and KotOR's rims/, in name order.
+    private func levelArchives() -> [URL] {
+        guard let root else { return [] }
+        let fm = FileManager.default
+        return ["Modules", "rims"].compactMap { fm.caseInsensitiveItem(named: $0, in: root) }.flatMap { folder in
+            ((try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
+                .filter { ["rim", "mod", "erf"].contains($0.pathExtension.lowercased()) }
+                .sorted { $0.lastPathComponent.lowercased() < $1.lastPathComponent.lowercased() }
+        }
     }
 }

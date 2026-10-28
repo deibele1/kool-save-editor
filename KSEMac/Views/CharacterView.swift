@@ -111,11 +111,25 @@ struct CharacterGeneralView: View {
     let character: CharacterID
 
     enum Picker: Identifiable {
-        case appearance, portrait, soundset
+        case appearance, portrait, voiceSet
         var id: Self { self }
     }
 
-    @State private var picker: Picker?
+    @State private var picker = Self.initialPicker
+    @State private var voice = VoicePlayer()
+
+    private static var initialPicker: Picker? {
+        #if DEBUG
+        switch UserDefaults.standard.string(forKey: "KSEMacPicker") {
+        case "appearance": .appearance
+        case "portrait": .portrait
+        case "voiceSet": .voiceSet
+        default: nil
+        }
+        #else
+        nil
+        #endif
+    }
 
     var body: some View {
         if let save = document.save, let creature = save.creature(character) {
@@ -133,15 +147,29 @@ struct CharacterGeneralView: View {
                         }
                     }
                     PickerRow(title: "Appearance", value: data?.appearanceName(creature.appearance) ?? "\(creature.appearance)",
-                              disabled: data?.appearances.isEmpty ?? true) { picker = .appearance }
+                              action: { picker = .appearance }, disabled: data?.appearances.isEmpty ?? true) {
+                        GameImage(name: data?.appearancePortraits[creature.appearance], assets: data?.assets, placeholder: "person.crop.square")
+                            .frame(width: 28, height: 28)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
                     PickerRow(title: "Portrait", value: data?.portraitName(creature.portrait) ?? "\(creature.portrait)",
                               action: { picker = .portrait }, disabled: data?.portraits.isEmpty ?? true) {
                         GameImage(name: data?.portraits[creature.portrait], assets: data?.assets, placeholder: "person.crop.square")
                             .frame(width: 28, height: 28)
                             .clipShape(RoundedRectangle(cornerRadius: 4))
                     }
-                    PickerRow(title: "Soundset", value: data?.soundsetName(creature.soundset) ?? "\(creature.soundset)",
-                              disabled: data?.soundsets.isEmpty ?? true) { picker = .soundset }
+                    PickerRow(title: "Voice set", value: data?.soundsetName(creature.soundset) ?? "\(creature.soundset)",
+                              action: { picker = .voiceSet }, disabled: data?.soundsets.isEmpty ?? true) {
+                        let audible = data?.soundsets[creature.soundset]?.hasSounds == true
+                        Button {
+                            if let data { voice.play(creature.soundset, from: data) }
+                        } label: {
+                            Image(systemName: "play.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!audible)
+                        .help(audible ? voice.caption(for: creature.soundset) ?? "Play a random line" : "This voice set makes no sound in this game")
+                    }
                 }
 
                 Section("Progress") {
@@ -205,21 +233,104 @@ struct CharacterGeneralView: View {
         let data = document.gameData
         switch picker {
         case .appearance:
-            ChoiceSheet(title: "Choose Appearance",
-                        choices: ChoiceSheet.Choice.from(data?.appearances ?? [:], including: creature.appearance) { "Appearance \($0)" },
-                        current: creature.appearance) { id in
+            ChoiceSheet(title: "Choose Appearance", choices: appearanceChoices(current: creature.appearance), current: creature.appearance,
+                        assets: data?.assets, thumbnailSize: 36, placeholder: "person.crop.square",
+                        note: "Faces come from the portraits the game pairs with appearances: player bodies and companions have one.") { id in
                 document.edit("Change Appearance") { $0.updateCreature(character) { $0.appearance = id } }
+            } accessory: { selection in
+                if let selection {
+                    HStack(spacing: 12) {
+                        GameImage(name: data?.appearancePortraits[selection], assets: data?.assets, placeholder: "person.crop.square")
+                            .frame(width: 96, height: 96)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(data?.appearanceName(selection) ?? "Appearance \(selection)").font(.headline)
+                            Text(data?.appearancePortraits[selection].map { "Portrait \($0)" } ?? "No portrait shows this appearance")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
             }
-        case .soundset:
-            ChoiceSheet(title: "Choose Soundset",
-                        choices: ChoiceSheet.Choice.from(data?.soundsets ?? [:], including: creature.soundset) { _ in "None" },
-                        current: creature.soundset) { id in
-                document.edit("Change Soundset") { $0.updateCreature(character) { $0.soundset = id } }
+        case .voiceSet:
+            ChoiceSheet(title: "Choose Voice Set", choices: voiceSetChoices(current: creature.soundset), current: creature.soundset,
+                        note: voiceSetNote) { id in
+                document.edit("Change Voice Set") { $0.updateCreature(character) { $0.soundset = id } }
+            } accessory: { selection in
+                VoiceSampleRow(gameData: data, soundset: selection)
             }
         case .portrait:
             PortraitSheet(gameData: data, current: creature.portrait) { id in
                 document.edit("Change Portrait") { $0.updateCreature(character) { $0.portrait = id } }
             }
+        }
+    }
+
+    private func appearanceChoices(current: Int) -> [TableChoice] {
+        let data = document.gameData
+        var labels = data?.appearances ?? [:]
+        if labels[current] == nil { labels[current] = "Appearance \(current)" }
+        return labels.map { TableChoice(id: $0.key, title: $0.value, image: data?.appearancePortraits[$0.key]) }
+            .sorted { ($0.title.localizedLowercase, $0.id) < ($1.title.localizedLowercase, $1.id) }
+    }
+
+    /// Player voice sets first, then companions, then everything else with "None" on top.
+    private func voiceSetChoices(current: Int) -> [TableChoice] {
+        guard let data = document.gameData else { return [] }
+        let sections = ["Player", "Party members", "Others"]
+        var entries = data.soundsets.values.map { info in
+            let section = info.isPlayer ? 0 : info.isPartyMember ? 1 : 2
+            return (section: section, silentByDesign: info.resRef == nil && info.isInTable ? 0 : 1,
+                    choice: TableChoice(id: info.id, title: info.name, detail: voiceSetDetail(info, data), section: sections[section]))
+        }
+        if data.soundsets[current] == nil {
+            entries.append((2, 0, TableChoice(id: current, title: data.soundsetName(current),
+                                              detail: current == 0xFFFF ? nil : "Not in this game’s soundset.2da", section: sections[2])))
+        }
+        return entries.sorted {
+            ($0.section, $0.silentByDesign, $0.choice.title.localizedLowercase, $0.choice.id)
+                < ($1.section, $1.silentByDesign, $1.choice.title.localizedLowercase, $1.choice.id)
+        }.map(\.choice)
+    }
+
+    private func voiceSetDetail(_ info: SoundsetInfo, _ data: GameData) -> String? {
+        var parts = info.gender.map { [data.genderName($0)] } ?? []
+        if !info.isInTable {
+            parts.append("silent (not in this game’s soundset.2da)")
+        } else if info.resRef != nil && !info.hasSounds {
+            parts.append("silent (sound set file missing)")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private var voiceSetNote: String? {
+        guard character == .player, let data = document.gameData,
+              data.soundsets.values.contains(where: { $0.isPlayer && !$0.isInTable }) else { return nil }
+        return "In \(data.game.title) the player is silent: its soundset.2da has no player voice sets. Mods that restore the player’s voice add them; until then choosing one makes no sound."
+    }
+}
+
+/// Plays a random line of a voice set and shows what was said.
+struct VoiceSampleRow: View {
+    let gameData: GameData?
+    let soundset: Int?
+
+    @State private var voice = VoicePlayer()
+
+    var body: some View {
+        let info = soundset.flatMap { gameData?.soundsets[$0] }
+        HStack(spacing: 10) {
+            Button {
+                if let soundset, let gameData { voice.play(soundset, from: gameData) }
+            } label: {
+                Label("Play Sample", systemImage: "play.fill")
+            }
+            .disabled(info?.hasSounds != true)
+            Text(voice.caption(for: soundset) ?? (soundset != nil && info?.hasSounds != true ? "Silent in this game" : ""))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer(minLength: 0)
         }
     }
 }
