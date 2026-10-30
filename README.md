@@ -29,6 +29,10 @@ to Applications.
 - Journal: change quest states, add and remove quests.
 - Global variables: booleans, numbers and strings.
 - Undo/redo for every edit; Xbox `.sig` files are regenerated when present.
+- Character sheets say when the game goes on with another copy of the character, which can't
+  be edited yet: the player in a TSL transition autosave (`pifo.ifo`), your own character while
+  you play as a companion (`pc.utc`), and companions standing in the current area (aboard the
+  Ebon Hawk).
 
 ### Versions and rollback
 
@@ -38,7 +42,13 @@ Files are then replaced atomically, read back and re-parsed. If a write or the v
 fails, the save is rolled back to that copy automatically. The Versions section lists every
 copy and restores any of them (restoring first saves the current state as another version).
 Saves changed on disk since they were opened (for example by the game) are detected before
-writing.
+writing: reload the newer save, or replace it as a whole with the one you are editing (the
+newer save is kept as a version first).
+
+While a game is running, the editor doesn't save or restore that game's saves: the game keeps
+its own copy of the save it loaded and overwrites the slot when it saves. Edit away, then quit
+the game and save. Saves the game rewrote are read again when it quits or when you switch back
+to the editor; if you have unsaved edits in one, you choose what to keep once the game has quit.
 
 ## Game data
 

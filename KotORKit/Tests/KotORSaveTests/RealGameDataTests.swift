@@ -16,6 +16,7 @@ struct RealGameDataTests {
         #expect(data.appearances.count > 100 && data.portraits.count > 20 && data.skills.count == 8)
         #expect(data.baseItems.count > 50 && data.quests.count > 10)
         #expect(data.skillName(0) != "Skill 0" && data.className(0) != "Class 0")
+        #expect(data.maximumLevel == game.maximumLevel, "exptable.2da of an unmodified game; a level-cap mod in Override changes it")
 
         let templates = await data.assets.itemTemplates()
         #expect(templates.count > 100)

@@ -240,12 +240,15 @@ public func tpcRGBA(width: Int, height: Int, rowsTopDown: [[UInt8]]) -> [UInt8] 
 
 public enum SaveFixture {
     public static let moduleName = "test_m01"
+    /// The companions with a sheet (AVAILNPC<n>.utc) in the fixture.
+    public static let companionNames = [0: "Bastila", 2: "Carth"]
 
-    public static func creature(name: String, player: Bool, tsl: Bool) -> GFFStruct {
+    /// A creature; the player layout (Mod_FirstName, struct ID 48813) has no tag unless given one.
+    public static func creature(name: String, player: Bool, tsl: Bool, tag: String? = nil) -> GFFStruct {
         var fields: [GFFField] = []
         if player { fields.append(GFFField(label: "Mod_FirstName", value: loc(name))) }
         let base = gffStruct(player ? 48813 : 0xFFFF_FFFF, [
-            "FirstName": loc(name), "LastName": loc(), "Tag": .string(player ? "" : name.lowercased()),
+            "FirstName": loc(name), "LastName": loc(), "Tag": .string(tag ?? (player ? "" : name.lowercased())),
             "Gender": .byte(0), "Str": .byte(14), "Dex": .byte(16), "Con": .byte(12), "Int": .byte(10),
             "Wis": .byte(11), "Cha": .byte(13), "SoundSetFile": .word(1), "Min1HP": .byte(0),
             "HitPoints": .short(30), "CurrentHitPoints": .short(25), "MaxHitPoints": .short(40),
@@ -277,19 +280,34 @@ public enum SaveFixture {
                       "XOrientation": .float(1), "NewItem": .byte(0)])
     }
 
-    /// Writes a complete, minimal save folder.
-    public static func write(to folder: URL, tsl: Bool = false, signatures: Bool = false) throws {
+    /// Writes a complete, minimal save folder. The other options write the cases where the game
+    /// goes on with another copy of a character than its sheet: `pcAutosave` makes it a
+    /// transition autosave (PCAUTOSAVE, the current player in pifo.ifo); `controlling` makes the
+    /// player sheet that companion's copy (PT_CONTROLLED_NP, the player character in pc.utc);
+    /// `inArea` puts copies of those companions, and a guard, among the area's creatures (.git).
+    public static func write(to folder: URL, tsl: Bool = false, signatures: Bool = false, pcAutosave: Bool = false,
+                             controlling: Int? = nil, inArea: [Int] = []) throws {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         var info = GFFDocument(fileType: "NFO ")
         info.root = gffStruct(0xFFFF_FFFF, ["AREANAME": .string("Test Area"), "LASTMODULE": .string(moduleName),
                                              "TIMEPLAYED": .dword(3725), "CHEATUSED": .byte(0), "SAVEGAMENAME": .string("Fixture"),
                                              "PORTRAIT0": .resRef("po_test")])
         if tsl { info.root["PCNAME"] = .string("Hero") }
+        if pcAutosave {
+            // Like the game's, it has no name of its own (the save list shows the folder name).
+            info.root["SAVEGAMENAME"] = nil
+            info.root["PCAUTOSAVE"] = .byte(1)
+            var current = creature(name: "Hero", player: true, tsl: tsl)
+            current["Experience"] = .dword(99_000) // newer than the copy in Module.ifo
+            var pifo = GFFDocument(fileType: "IFO ")
+            pifo.root = gffStruct(0xFFFF_FFFF, ["Mod_PlayerList": .list([current])])
+            try Data(pifo.encoded()).write(to: folder.appendingPathComponent("pifo.ifo"))
+        }
 
         let npcCount = tsl ? 12 : 9
         var party = GFFDocument(fileType: "PT  ")
         party.root = gffStruct(0xFFFF_FFFF, [
-            "PT_GOLD": .dword(100), "PT_XP_POOL": .int(50), "PT_PLAYEDSECONDS": .dword(3725), "PT_CONTROLLED_NP": .int(2),
+            "PT_GOLD": .dword(100), "PT_XP_POOL": .int(50), "PT_PLAYEDSECONDS": .dword(3725), "PT_CONTROLLED_NP": .int(-1),
             "PT_CHEAT_USED": .byte(0), "PT_NUM_MEMBERS": .byte(1),
             "PT_MEMBERS": .list([gffStruct(0, ["PT_MEMBER_ID": .int(2), "PT_IS_LEADER": .byte(0)])]),
             "PT_AVAIL_NPCS": .list((0 ..< npcCount).map { gffStruct(0, ["PT_NPC_AVAIL": .byte($0 == 0 || $0 == 2 ? 1 : 0), "PT_NPC_SELECT": .byte(1)]) }),
@@ -301,6 +319,7 @@ public enum SaveFixture {
             party.root["PT_ITEM_CHEMICAL"] = .dword(9)
             party.root["PT_INFLUENCE"] = .list((0 ..< 10).map { gffStruct(0, ["PT_NPC_INFLUENCE": .int(Int32(40 + $0))]) })
         }
+        if let controlling { party.root["PT_CONTROLLED_NP"] = .int(Int32(controlling)) }
 
         var globals = GFFDocument(fileType: "GVT ")
         globals.root = gffStruct(0xFFFF_FFFF, [
@@ -311,11 +330,15 @@ public enum SaveFixture {
             "ValString": .list([gffStruct(0, ["String": .string("abc")])]),
         ])
 
+        let controlled = controlling.flatMap { companionNames[$0] }
+        let player = controlled.map { creature(name: $0, player: true, tsl: tsl, tag: $0.lowercased()) }
+            ?? creature(name: "Hero", player: true, tsl: tsl)
         var module = GFFDocument(fileType: "IFO ")
         module.root = gffStruct(0xFFFF_FFFF, ["Mod_NextObjId0": .dword(500), "Mod_Tag": .string(""),
-                                               "Mod_PlayerList": .list([creature(name: "Hero", player: true, tsl: tsl)])])
+                                               "Mod_PlayerList": .list([player])])
+        let standing = inArea.compactMap { companionNames[$0] }.map { creature(name: $0, player: false, tsl: tsl) }
         var git = GFFDocument(fileType: "GIT ")
-        git.root = gffStruct(0xFFFF_FFFF, ["Creature List": .list([])])
+        git.root = gffStruct(0xFFFF_FFFF, ["Creature List": .list(standing.isEmpty ? [] : standing + [creature(name: "Guard", player: false, tsl: tsl)])])
         let inner = ERFArchive(fileType: "MOD ", resources: [
             .init(resRef: "m01", type: .git, resID: 0, data: git.encoded()),
             .init(resRef: "Module", type: .ifo, resID: 1, data: module.encoded()),
@@ -344,6 +367,11 @@ public enum SaveFixture {
             .init(resRef: "other_m00", type: .sav, resID: 4, data: Array(repeating: 0xAB, count: 64)),
             .init(resRef: moduleName, type: .sav, resID: 5, data: inner.encoded()),
         ])
+        if controlled != nil {
+            var pc = GFFDocument(fileType: "UTC ")
+            pc.root = creature(name: "Hero", player: true, tsl: tsl)
+            archive.resources.append(.init(resRef: "pc", type: .utc, resID: 6, data: pc.encoded()))
+        }
         archive.buildYear = 124
         archive.buildDay = 345
 
@@ -443,6 +471,7 @@ public enum GameInstallFixture {
                                            ["Medpac", "22", "i_medeqpmnt", "0x00000", "0", "", "", "10"],
                                            ["Long_Sword", "", "w_lsword", "0x00030", "1", "1", "", "1"],
                                            ["Armor", "23", "a_class4", "0x00002", "1", "", "", "1"]])),
+            ("exptable", binary2DA(columns: ["level", "xp"], rows: [["1", "0"], ["2", "1000"], ["3", "3000"], ["4", "0xFFFFFFFF"]])),
         ]
 
         let templates: [(String, [UInt8])] = [

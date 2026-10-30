@@ -36,7 +36,8 @@ struct GlobalsView: View {
                 }
                 .width(min: 140, ideal: 200)
             }
-            Text("Global variables drive quest progress and story choices. Change them only if you know what a variable does; the previous version is always kept.")
+            Text("Global variables drive quest progress and story choices. Change them only if you know what a variable does; the previous version is always kept."
+                 + (kind == .number ? " Numbers go from −128 to 127, as the games’ scripts read them." : ""))
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -53,12 +54,13 @@ struct GlobalsView: View {
                                               { $0.setGlobalBoolean(variable.index, $1) }))
                 .labelsHidden()
         case .number:
-            Stepper(value: numberBinding(variable), in: 0 ... 255) {
+            Stepper(value: numberBinding(variable), in: SaveGame.globalNumberRange) {
                 TextField("Value", value: numberBinding(variable), format: .number)
                     .labelsHidden()
                     .multilineTextAlignment(.trailing)
                     .frame(width: 56)
             }
+            .help("−128 to 127, as the game’s scripts see it")
         case .string:
             CommitTextField(title: "Value", value: variable.text) { text in
                 document.edit("Change \(variable.name)") { $0.setGlobalString(variable.index, text) }
@@ -67,9 +69,13 @@ struct GlobalsView: View {
         }
     }
 
+    /// Clamps before the document's binding compares values, so typing a number past the range
+    /// that clamps to the current value records no edit.
     private func numberBinding(_ variable: GlobalVariable) -> Binding<Int> {
-        document.binding("Change \(variable.name)",
-                         { $0.globalNumber(variable.index) },
-                         { $0.setGlobalNumber(variable.index, min(255, max(0, $1))) })
+        let range = SaveGame.globalNumberRange
+        let binding = document.binding("Change \(variable.name)",
+                                       { $0.globalNumber(variable.index) },
+                                       { $0.setGlobalNumber(variable.index, $1) })
+        return Binding(get: { binding.wrappedValue }, set: { binding.wrappedValue = min(max($0, range.lowerBound), range.upperBound) })
     }
 }

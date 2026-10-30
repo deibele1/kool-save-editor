@@ -12,10 +12,12 @@ struct CommitTests {
         var save: SaveGame
     }
 
-    func setup(signatures: Bool = false, tsl: Bool = false) throws -> Setup {
+    /// A fixture save; the `missing` files are deleted before it is read.
+    func setup(signatures: Bool = false, tsl: Bool = false, missing: [String] = []) throws -> Setup {
         let root = try temporaryDirectory()
         let folder = root.appendingPathComponent("saves/000003 - Game2")
         try SaveFixture.write(to: folder, tsl: tsl, signatures: signatures)
+        for file in missing { try FileManager.default.removeItem(at: folder.appendingPathComponent(file)) }
         return Setup(folder: folder, store: SaveVersionStore(root: root.appendingPathComponent("Versions")),
                      save: try SaveGame.load(from: folder))
     }
@@ -201,6 +203,156 @@ struct CommitTests {
         #expect(s.store.versions(for: s.folder).isEmpty)
         let result = try SaveWriter.commit(edited, baseline: s.save, store: s.store, summary: "x", overwriteExternalChanges: true)
         #expect(result.reloaded.credits == 5)
+    }
+
+    @Test func undoingPastASaveWritesTheUndoneDocumentsNotTheArchivesTheyCarry() throws {
+        let s = try setup()
+        let original = try contents(s.folder)
+        var experience = s.save
+        experience.updateCreature(.player) { $0.experience = 14_000 }
+        var credits = experience
+        credits.credits = 200
+        let saved = try SaveWriter.commit(credits, baseline: s.save, store: s.store, summary: "Experience, Credits").reloaded
+
+        // Undoing the credits brings back the copy made before them, whose archives were read
+        // before the save: only the party table may change.
+        #expect(experience.hasChanges(since: saved))
+        let undone = try SaveWriter.commit(experience, baseline: saved, store: s.store, summary: "Undo Credits")
+        #expect(undone.writtenFiles == ["PARTYTABLE.res"])
+        #expect(undone.reloaded.creature(.player)?.experience == 14_000)
+        #expect(undone.reloaded.credits == 100)
+
+        // Undoing the experience as well writes the original save back, byte for byte.
+        let both = try SaveWriter.commit(s.save, baseline: undone.reloaded, store: s.store, summary: "Undo Experience")
+        #expect(both.writtenFiles == ["SAVEGAME.sav"])
+        #expect(try contents(s.folder) == original)
+    }
+
+    @Test func redoingPastASaveAndEditingAgainKeepsWhatWasSaved() throws {
+        let s = try setup()
+        var edited = s.save
+        edited.updateCreature(.player) { $0.experience = 14_000 }
+        edited.updateCreature(.npc(2)) { $0[.wisdom] = 18 }
+        edited.setStackSize(0, 9)
+        let saved = try SaveWriter.commit(edited, baseline: s.save, store: s.store, summary: "Edits").reloaded
+
+        // Undo and redo bring back `edited` itself, archives read before the save included. It
+        // matches the save on disk, and committing it doesn't make it the baseline.
+        #expect(!edited.hasChanges(since: saved) && edited.changedFiles(since: saved).isEmpty)
+        let unchanged = try SaveWriter.commit(edited, baseline: saved, store: s.store, summary: "Nothing")
+        #expect(unchanged.version == nil && unchanged.writtenFiles.isEmpty)
+        #expect(unchanged.reloaded.archive == saved.archive && unchanged.reloaded.fingerprints == saved.fingerprints)
+
+        // A further edit writes only its own file; nothing that was saved goes back.
+        var again = edited
+        again.credits = 300
+        let result = try SaveWriter.commit(again, baseline: saved, store: s.store, summary: "Change Credits")
+        #expect(result.writtenFiles == ["PARTYTABLE.res"])
+        #expect(result.reloaded.credits == 300)
+        #expect(result.reloaded.creature(.player)?.experience == 14_000)
+        #expect(result.reloaded.creature(.npc(2))?[.wisdom] == 18)
+        #expect(result.reloaded.inventoryItems.first?.stackSize == 9)
+    }
+
+    @Test func replacingOutsideChangesWritesTheWholeSaveAsOpenedPlusTheEdits() throws {
+        let s = try setup()
+        let opened = try contents(s.folder)
+        var edited = s.save
+        edited.credits = 5
+
+        // The game saves over the slot: more play time, a global, experience and a screenshot,
+        // mostly in files the editor didn't change.
+        var played = s.save
+        played.timePlayed += 3600
+        played.setGlobalNumber(0, 42)
+        played.updateCreature(.player) { $0.experience = 20_000 }
+        for (name, bytes) in played.changedFiles(since: s.save) { try Data(bytes).write(to: s.folder.appendingPathComponent(name)) }
+        try Data([1, 2, 3]).write(to: s.folder.appendingPathComponent("Screen.tga"))
+        let newer = try contents(s.folder)
+        #expect(throws: CommitError.self) { try SaveWriter.commit(edited, baseline: s.save, store: s.store, summary: "x") }
+
+        let result = try SaveWriter.commit(edited, baseline: s.save, store: s.store, summary: "Change Credits",
+                                           overwriteExternalChanges: true)
+        var expected = opened
+        expected["PARTYTABLE.res"] = Data(edited.party.encoded())
+        #expect(try contents(s.folder) == expected, "every file comes from the editor's save")
+        #expect(Set(result.writtenFiles) == Set(opened.keys))
+        #expect(result.reloaded.credits == 5 && result.reloaded.timePlayed == 3725)
+        #expect(result.reloaded.creature(.player)?.experience == 12_000)
+
+        // The version kept before writing restores the game's save completely.
+        try s.store.restore(try #require(result.version), to: s.folder)
+        #expect(try contents(s.folder) == newer)
+    }
+
+    @Test func replacingOutsideChangesRemovesSaveFilesThatAppearedSinceTheSaveWasRead() throws {
+        let s = try setup(signatures: true, missing: ["Screen.tga"])
+        let opened = try contents(s.folder)
+        var edited = s.save
+        edited.credits = 5
+
+        // The game saves over the slot with a screenshot this save didn't have.
+        var played = s.save
+        played.timePlayed += 60
+        for (name, bytes) in played.changedFiles(since: s.save) { try Data(bytes).write(to: s.folder.appendingPathComponent(name)) }
+        try Data([1, 2, 3]).write(to: s.folder.appendingPathComponent("Screen.tga"))
+
+        let result = try SaveWriter.commit(edited, baseline: s.save, store: s.store, summary: "Change Credits",
+                                           overwriteExternalChanges: true)
+        let after = try contents(s.folder)
+        #expect(after["Screen.tga"] == nil && after["Screen.sig"] == opened["Screen.sig"])
+        #expect(after["savenfo.res"] == opened["savenfo.res"] && after["SAVEGAME.sav"] == opened["SAVEGAME.sav"])
+        let key = SymmetricKey(data: Game.kotor1.signatureKey)
+        for (file, sig) in [("savenfo.res", "SAVE_INFO.sig"), ("PARTYTABLE.res", "SAVE_PARTY.sig"), ("GLOBALVARS.res", "SAVE_VARS.sig")] {
+            #expect(after[sig] == Data(HMAC<Insecure.SHA1>.authenticationCode(for: try #require(after[file]), using: key)), "\(sig)")
+        }
+
+        try s.store.restore(try #require(result.version), to: s.folder)
+        #expect(try contents(s.folder)["Screen.tga"] == Data([1, 2, 3]))
+    }
+
+    @Test func replacingATransitionAutosaveWritesBackItsPIFOAsRead() throws {
+        let root = try temporaryDirectory()
+        let folder = root.appendingPathComponent("saves/000001 - AUTOSAVE")
+        try SaveFixture.write(to: folder, tsl: true, pcAutosave: true)
+        let store = SaveVersionStore(root: root.appendingPathComponent("Versions"))
+        let save = try SaveGame.load(from: folder)
+        let opened = try contents(folder)
+        var edited = save
+        edited.credits = 5
+
+        // The game saves over the slot with a newer player in pifo.ifo.
+        try Data([9, 9, 9]).write(to: folder.appendingPathComponent("pifo.ifo"))
+        #expect(save.externallyModifiedFiles() == ["pifo.ifo"])
+        let newer = try contents(folder)
+
+        let result = try SaveWriter.commit(edited, baseline: save, store: store, summary: "Change Credits",
+                                           overwriteExternalChanges: true)
+        #expect(try contents(folder)["pifo.ifo"] == opened["pifo.ifo"], "the player that goes with the editor's save")
+        #expect(result.reloaded.credits == 5 && result.reloaded.isPCAutosave)
+        try store.restore(try #require(result.version), to: folder)
+        #expect(try contents(folder) == newer)
+    }
+
+    @Test func undoingPastTheSaveThatAddedTheInventoryRemovesItAgain() throws {
+        let s = try setup()
+        let items = try #require(s.save.inventory?.root.list("ItemList"))
+        var archive = s.save.archive
+        archive.resources.removeAll { $0.resRef.lowercased() == "inventory" && $0.type == .res }
+        try Data(archive.encoded()).write(to: s.folder.appendingPathComponent("SAVEGAME.sav"))
+        let original = try contents(s.folder)
+        let empty = try SaveGame.load(from: s.folder)
+        #expect(empty.inventory == nil)
+
+        var pasted = empty
+        pasted.replaceInventory(with: Array(items.prefix(1)))
+        let saved = try SaveWriter.commit(pasted, baseline: empty, store: s.store, summary: "Paste Inventory").reloaded
+        #expect(saved.inventoryItems.count == 1)
+
+        // Undo brings back the copy without an inventory, and saving it removes INVENTORY.res.
+        let undone = try SaveWriter.commit(empty, baseline: saved, store: s.store, summary: "Undo Paste Inventory")
+        #expect(undone.writtenFiles == ["SAVEGAME.sav"] && undone.reloaded.inventory == nil)
+        #expect(try contents(s.folder) == original)
     }
 
     @Test func oldVersionsArePrunedAndDamagedSnapshotsRefuseToRestore() throws {

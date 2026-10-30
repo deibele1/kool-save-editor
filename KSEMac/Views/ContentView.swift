@@ -27,7 +27,9 @@ struct ContentView: View {
         } detail: {
             Group {
                 if let document = model.selectedDocument {
-                    DetailView(document: document)
+                    // One view per save: a field being typed in goes away with its save and
+                    // applies its text there (see CommitTextField).
+                    DetailView(document: document).id(document.id)
                 } else {
                     Image(systemName: "shield.lefthalf.filled")
                         .font(.system(size: 64))
@@ -63,6 +65,55 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+        // Revert and Reload from the toolbar, the menus and the save list all ask here. The
+        // save is named because a save-list target may not be the one on screen.
+        .confirmationDialog(discardTitle, isPresented: Binding(get: { model.pendingDiscard != nil }, set: { if !$0 { model.pendingDiscard = nil } }),
+                            titleVisibility: .visible, presenting: model.pendingDiscard) { request in
+            Button(request.action == .revert ? "Revert" : "Reload", role: .destructive) { model.discard(request) }
+            Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.defaultAction)
+        } message: { request in
+            Text(request.action == .revert
+                ? "Your unsaved changes (\(request.document.changeSummary)) will be discarded. You can’t undo this."
+                : "Your unsaved changes (\(request.document.changeSummary)) will be discarded and the save read again from disk. You can’t undo this.")
+        }
+        .confirmationDialog(pasteTitle, isPresented: Binding(get: { model.pendingPaste != nil }, set: { if !$0 { model.pendingPaste = nil } }),
+                            titleVisibility: .visible, presenting: model.pendingPaste) { document in
+            Button("Replace Inventory", role: .destructive) { model.pasteInventory(into: document) }
+            Button("Cancel", role: .cancel) {}
+                .keyboardShortcut(.defaultAction)
+        } message: { document in
+            Text(pasteMessage(document))
+        }
+    }
+
+    private var discardTitle: String {
+        guard let request = model.pendingDiscard else { return "" }
+        let name = request.document.summary.name
+        return request.action == .revert ? "Revert “\(name)” to the saved version?" : "Reload “\(name)” from disk?"
+    }
+
+    private var pasteTitle: String {
+        model.pendingPaste.map { "Replace the inventory of “\($0.summary.name)”?" } ?? ""
+    }
+
+    private func pasteMessage(_ document: SaveDocument) -> String {
+        func items(_ count: Int) -> String { count == 1 ? "1 item" : "\(count) items" }
+        let current = document.save?.inventoryItems.count ?? 0
+        let copied = model.inventoryClipboard?.items.count ?? 0
+        let source = model.inventoryClipboard?.sourceName ?? ""
+        let pasted = copied == 1 ? "the item copied from “\(source)”" : "the \(copied) items copied from “\(source)”"
+        var message = switch (current, copied) {
+        case (0, 0): "It has no items, and neither does the inventory copied from “\(source)”."
+        case (0, _): "It has no items; \(pasted) will be added."
+        case (_, 0): "Its \(items(current)) will be removed: the inventory copied from “\(source)” is empty."
+        default: "Its \(items(current)) will be replaced by \(pasted)."
+        }
+        let quests = model.questItemsLostByPasting(into: document)
+        if quests > 0 {
+            message += " That removes \(quests == 1 ? "a quest item" : "\(quests) quest items") the copied inventory doesn’t have, which quests may need."
+        }
+        return message + " You can undo this or revert before saving."
     }
 
     private var title: String { model.selectedDocument?.summary.name ?? "Kool Save Editor" }
@@ -79,15 +130,17 @@ struct ContentView: View {
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
             if let document = model.selectedDocument {
+                // Not the Undo arrow (arrow.uturn.backward): this discards every edit.
                 Button {
-                    document.revert()
+                    model.requestRevert(document)
                 } label: {
-                    Label("Revert", systemImage: "arrow.uturn.backward")
+                    Label("Revert to Saved", systemImage: "arrow.counterclockwise")
                 }
-                .help("Discard unsaved changes")
-                .disabled(!document.isDirty || document.isSaving)
+                .help("Revert to Saved: discard all unsaved changes to this save")
+                .disabled(!model.hasUnsavedChanges(document) || document.isSaving)
 
                 Button {
+                    model.commitTyping()
                     Task { await document.commit(using: model) }
                 } label: {
                     if document.isSaving {
@@ -96,8 +149,10 @@ struct ContentView: View {
                         Label("Save", systemImage: "square.and.arrow.down")
                     }
                 }
-                .help("Write the changes to the save (a backup version is kept)")
-                .disabled(!document.isDirty || document.isSaving)
+                .help(model.isGameRunning(document.game)
+                    ? "Quit \(document.game.title) before saving: it would overwrite the changes"
+                    : "Write the changes to the save (a backup version is kept)")
+                .disabled(!model.hasUnsavedChanges(document) || document.isSaving || model.isGameRunning(document.game))
             }
         }
     }
@@ -381,7 +436,7 @@ struct SaveContextMenu: View {
         let document = model.documents[summary.id]
         Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([summary.folder]) }
         Button("Reload from Disk") {
-            if let document { document.reload(using: model) } else { model.selectedSaveID = summary.id }
+            if let document { model.requestReload(document) } else { model.selectedSaveID = summary.id }
         }
         Divider()
         Button("Copy Inventory") {
@@ -389,8 +444,8 @@ struct SaveContextMenu: View {
             if let document = model.documents[summary.id], document.isReady { model.copyInventory(from: document) }
         }
         .disabled(!(document?.isReady ?? false))
-        Button("Paste Inventory") {
-            if let document { model.pasteInventory(into: document) }
+        Button("Paste Inventory…") {
+            if let document { model.requestPasteInventory(into: document) }
         }
         .disabled(!model.canPasteInventory(into: document))
         Divider()
@@ -418,7 +473,7 @@ struct OutlineView: View {
             } description: {
                 Text(message)
             } actions: {
-                Button("Try Again") { document.reload(using: model) }
+                Button("Try Again") { model.requestReload(document) }
                 Button("Show Versions") { document.section = .versions }
             }
         case .ready:
@@ -428,7 +483,7 @@ struct OutlineView: View {
                         row("Summary", "info.circle", .summary)
                     }
                     Section("Characters") {
-                        row(document.name(of: .player), "person.crop.circle.fill", .character(.player))
+                        row(document.playerTitle, "person.crop.circle.fill", .character(.player))
                         ForEach(document.save?.companionIndices ?? [], id: \.self) { index in
                             row(document.name(of: .npc(index)), "person.crop.circle", .character(.npc(index)))
                         }
@@ -472,35 +527,50 @@ struct DetailView: View {
     @Bindable var document: SaveDocument
 
     var body: some View {
-        Group {
-            if case .ready = document.state, document.save != nil {
-                switch document.section ?? .summary {
-                case .summary: SummaryView(document: document)
-                case .character(let character): CharacterView(document: document, character: character).id(character)
-                case .party: PartyView(document: document)
-                case .inventory: InventoryView(document: document)
-                case .journal: JournalView(document: document)
-                case .globals: GlobalsView(document: document)
-                case .versions: VersionsView(document: document)
+        VStack(spacing: 0) {
+            // Not fixed-size: wrapping text with a fixed size above a table broke the window's layout.
+            if model.isGameRunning(document.game) {
+                GameRunningNotice(game: document.game)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+            }
+            Group {
+                if case .ready = document.state, document.save != nil {
+                    switch document.section ?? .summary {
+                    case .summary: SummaryView(document: document)
+                    case .character(let character): CharacterView(document: document, character: character).id(character)
+                    case .party: PartyView(document: document)
+                    case .inventory: InventoryView(document: document)
+                    case .journal: JournalView(document: document)
+                    case .globals: GlobalsView(document: document)
+                    case .versions: VersionsView(document: document)
+                    }
+                } else if document.section == .versions {
+                    VersionsView(document: document)
+                } else {
+                    Color.clear
                 }
-            } else if document.section == .versions {
-                VersionsView(document: document)
-            } else {
-                Color.clear
             }
         }
         .alert("The Save Changed on Disk", isPresented: Binding(get: { document.externalChanges != nil }, set: { if !$0 { document.externalChanges = nil } })) {
-            Button("Save Anyway", role: .destructive) {
-                document.externalChanges = nil
-                Task { await document.commit(using: model, overwriteExternalChanges: true) }
+            // Saving waits until the game has quit, as the toolbar's Save does.
+            if !model.isGameRunning(document.game) {
+                Button("Replace with My Version", role: .destructive) {
+                    document.externalChanges = nil
+                    Task { await document.commit(using: model, overwriteExternalChanges: true) }
+                }
             }
             Button("Reload and Discard Edits") {
                 document.externalChanges = nil
                 document.reload(using: model)
             }
             Button("Cancel", role: .cancel) { document.externalChanges = nil }
+                .keyboardShortcut(.defaultAction)
         } message: {
-            Text("\((document.externalChanges ?? []).joined(separator: ", ")) changed since the save was opened, perhaps because the game saved over it. Saving now replaces those changes; the current files are kept as a version either way.")
+            let replacing = model.isGameRunning(document.game)
+                ? "Once \(document.game.title) has quit, you can replace it with your version."
+                : "Replace with My Version writes the whole save as you see it here, edits included, in place of the newer one. The newer save is kept in Versions first, so you can restore it."
+            Text("\((document.externalChanges ?? []).joined(separator: ", ")) changed outside the editor, perhaps because the game saved over this save. \(replacing)")
         }
         .alert("Couldn’t Save", isPresented: Binding(get: { document.errorMessage != nil }, set: { if !$0 { document.errorMessage = nil } })) {
             Button("OK") { document.errorMessage = nil }

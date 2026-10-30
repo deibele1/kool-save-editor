@@ -20,6 +20,18 @@ struct InventoryClipboard {
     var items: [GFFStruct]
 }
 
+/// Revert to Saved or Reload from Disk on a save with unsaved edits, waiting for the user to
+/// confirm that the edits are discarded.
+struct DiscardRequest {
+    enum Action {
+        case revert
+        case reload
+    }
+
+    let document: SaveDocument
+    let action: Action
+}
+
 @Observable
 final class AppModel {
     var preferences: Preferences {
@@ -44,19 +56,32 @@ final class AppModel {
     }
     var inventoryClipboard: InventoryClipboard?
     var errorMessage: String?
+    /// Shown by the window's confirmation: discarding edits (Revert, Reload) and Paste Inventory….
+    var pendingDiscard: DiscardRequest?
+    var pendingPaste: SaveDocument?
+    /// Text typed into a name field that is not applied yet (see `CommitTextField`).
+    private(set) var typing: TypedText?
 
     let versionStore = SaveVersionStore()
+    let gameMonitor = GameMonitor()
     @ObservationIgnored private var gameDataTasks: [Game: Task<GameData, Never>] = [:]
     @ObservationIgnored private var thumbnailRequests: Set<String> = []
+    @ObservationIgnored private var thumbnailReads: Set<String> = []
+    @ObservationIgnored private var scanGenerations: [String: Int] = [:]
 
     init() {
         preferences = .load()
         Game.allCases.forEach { _ = loadGameData($0) }
         refresh()
+        // A game that quits may have saved over the slots.
+        gameMonitor.didQuit = { [weak self] _ in self?.refresh() }
     }
 
     var selectedDocument: SaveDocument? { selectedSaveID.flatMap { documents[$0] } }
     var dirtyDocuments: [SaveDocument] { documents.values.filter(\.isDirty).sorted { $0.summary.name < $1.summary.name } }
+
+    /// A running game overwrites its saves with its own copy, so they aren't written while it runs.
+    func isGameRunning(_ game: Game) -> Bool { gameMonitor.isRunning(game) }
 
     // MARK: Save locations
 
@@ -87,6 +112,8 @@ final class AppModel {
     func scan(_ location: SaveLocation) {
         locationStates[location.id, default: LocationState()].isLoading = true
         let encoding = gameData[location.game]?.encoding ?? .windows1252
+        let generation = (scanGenerations[location.id] ?? 0) + 1
+        scanGenerations[location.id] = generation
         Task {
             let result = await Task.detached(priority: .userInitiated) { () -> Result<[SaveSummary], Error> in
                 Result {
@@ -96,6 +123,9 @@ final class AppModel {
                         .sorted { $0.modified > $1.modified }
                 }
             }.value
+            // Scans overlap (a game quitting and the app becoming active both refresh): only the
+            // newest one describes the folder.
+            guard scanGenerations[location.id] == generation else { return }
             var state = LocationState()
             switch result {
             case .success(let summaries): state.summaries = summaries
@@ -105,8 +135,17 @@ final class AppModel {
                 state.errorHelp = problem.help
                 state.isBlockedByPrivacy = problem.isPrivacy
             }
+            let previous = locationStates[location.id]?.summaries ?? []
             locationStates[location.id] = state
             for summary in state.summaries { documents[summary.id]?.summary = summary }
+            // Saves rewritten since they were opened or listed (the game saved over them, or Steam
+            // Cloud downloaded them): open ones are read again, and so are their screenshots.
+            for document in documents.values where document.location.id == location.id {
+                document.reloadIfChangedOnDisk(using: self)
+            }
+            for summary in state.summaries where previous.contains(where: { $0.id == summary.id && $0 != summary }) {
+                invalidateThumbnail(for: summary.id)
+            }
             #if DEBUG
             if Self.savesFolderOverride != nil, selectedSaveID == nil, let first = state.summaries.first {
                 selectedSaveID = first.id
@@ -208,7 +247,13 @@ final class AppModel {
     // MARK: Documents
 
     private func openSelected() {
-        guard let id = selectedSaveID, documents[id] == nil, let (summary, location) = location(for: id) else { return }
+        guard let id = selectedSaveID else { return }
+        if let document = documents[id] {
+            // Already open: the game may have saved over it while another save was selected.
+            document.reloadIfChangedOnDisk(using: self)
+            return
+        }
+        guard let (summary, location) = location(for: id) else { return }
         let document = SaveDocument(summary: summary, location: location)
         documents[id] = document
         document.load(using: self)
@@ -219,10 +264,40 @@ final class AppModel {
         if selectedSaveID == document.id { openSelected() }
     }
 
-    /// Saves every edited save. Returns false if any save failed.
-    func saveAll() async -> Bool {
+    /// Whether Save and Revert have something to act on, counting text still being typed (which
+    /// only ever belongs to the selected save: a field applies its text when it goes away).
+    func hasUnsavedChanges(_ document: SaveDocument?) -> Bool {
+        guard let document else { return false }
+        return document.isDirty || (typing != nil && document === selectedDocument)
+    }
+
+    /// Revert to Saved: puts back the save as loaded or last saved, after asking when that
+    /// discards edits.
+    func requestRevert(_ document: SaveDocument) {
+        commitTyping()
+        guard document.isDirty else { return }
+        pendingDiscard = DiscardRequest(document: document, action: .revert)
+    }
+
+    /// Reload from Disk: reads the save again, at once when it has no edits, else after asking.
+    func requestReload(_ document: SaveDocument) {
+        commitTyping()
+        let request = DiscardRequest(document: document, action: .reload)
+        if document.isDirty { pendingDiscard = request } else { discard(request) }
+    }
+
+    func discard(_ request: DiscardRequest) {
+        pendingDiscard = nil
+        switch request.action {
+        case .revert: request.document.revert()
+        case .reload: request.document.reload(using: self)
+        }
+    }
+
+    /// Saves every edited save, or just `documents`. Returns false if any save failed.
+    func saveAll(_ documents: [SaveDocument]? = nil) async -> Bool {
         var succeeded = true
-        for document in dirtyDocuments {
+        for document in documents ?? dirtyDocuments {
             await document.commit(using: self)
             if document.isDirty { succeeded = false }
         }
@@ -233,16 +308,24 @@ final class AppModel {
 
     func loadThumbnail(for summary: SaveSummary) {
         guard thumbnails[summary.id] == nil, thumbnailRequests.insert(summary.id).inserted else { return }
+        readThumbnail(summary)
+    }
+
+    /// Reads a save's screenshot again after the save was rewritten; the old one shows until
+    /// then. Thumbnails not shown yet are read when they are.
+    func invalidateThumbnail(for id: String) {
+        guard thumbnailRequests.contains(id), let (summary, _) = location(for: id) else { return }
+        readThumbnail(summary)
+    }
+
+    private func readThumbnail(_ summary: SaveSummary) {
+        guard thumbnailReads.insert(summary.id).inserted else { return }
         let folder = summary.folder
         Task {
             let image = await Task.detached(priority: .utility) { SaveGame.screenshot(in: folder) }.value
-            if let image = image?.nsImage { thumbnails[summary.id] = image }
+            thumbnailReads.remove(summary.id)
+            thumbnails[summary.id] = image?.nsImage
         }
-    }
-
-    func invalidateThumbnail(for id: String) {
-        thumbnails[id] = nil
-        thumbnailRequests.remove(id)
     }
 
     // MARK: Inventory clipboard
@@ -254,12 +337,54 @@ final class AppModel {
     }
 
     func canPasteInventory(into document: SaveDocument?) -> Bool {
-        guard let clipboard = inventoryClipboard, let save = document?.save else { return false }
+        // Not while the save is (re)loading: it would paste into the copy being replaced.
+        guard let clipboard = inventoryClipboard, let document, document.isReady, let save = document.save else { return false }
         return clipboard.game == save.game
     }
 
+    /// Paste Inventory… from the Inventory section, the Savegame menu or the save list: selects the
+    /// save and shows its inventory, then asks. Only the selected save has the window's undo
+    /// manager, so this is what makes the paste undoable.
+    func requestPasteInventory(into document: SaveDocument) {
+        guard canPasteInventory(into: document) else { return }
+        selectedSaveID = document.id
+        document.section = .inventory
+        pendingPaste = document
+    }
+
     func pasteInventory(into document: SaveDocument) {
-        guard canPasteInventory(into: document), let clipboard = inventoryClipboard else { return }
+        pendingPaste = nil
+        guard document === selectedDocument, canPasteInventory(into: document), let clipboard = inventoryClipboard else { return }
         document.edit("Paste Inventory") { $0.replaceInventory(with: clipboard.items) }
+    }
+
+    /// Quest items in a save's inventory that the copied inventory doesn't have (by tag), which
+    /// pasting removes.
+    func questItemsLostByPasting(into document: SaveDocument) -> Int {
+        guard let save = document.save, let clipboard = inventoryClipboard else { return 0 }
+        let encoding = save.encoding
+        let pasted = Set(clipboard.items.compactMap { $0.string("Tag", encoding: encoding)?.lowercased() })
+        return (save.inventory?.root.list("ItemList") ?? []).filter { item in
+            (item.integer("Plot") ?? 0) != 0 && !pasted.contains(item.string("Tag", encoding: encoding)?.lowercased() ?? "")
+        }.count
+    }
+
+    // MARK: Typing
+
+    func beginTyping(_ text: TypedText) {
+        if let typing, typing !== text { finishTyping(typing) }
+        typing = text
+    }
+
+    /// Applies typed text (if it changed anything) to the save and character it was typed for.
+    func finishTyping(_ text: TypedText, endingEditing: Bool = false) {
+        text.finish(endingEditing: endingEditing)
+        if typing === text { typing = nil }
+    }
+
+    /// Applies the text being typed, if any, and ends editing: Save, Revert, Reload and Quit
+    /// call this first, so typed text is neither lost nor applied later on top of their result.
+    func commitTyping() {
+        if let typing { finishTyping(typing, endingEditing: true) }
     }
 }

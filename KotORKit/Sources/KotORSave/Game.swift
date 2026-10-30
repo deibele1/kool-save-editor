@@ -11,6 +11,25 @@ public enum Game: String, Codable, CaseIterable, Sendable, Identifiable {
 
     public var id: String { rawValue }
 
+    /// The game a running application is, by bundle identifier; nil for other applications.
+    /// TSL is the “com.aspyr.kotor2” family (Steam com.aspyr.kotor2.steam, Mac App Store
+    /// com.aspyr.kotor2.appstore and com.aspyr.kotor2), KotOR the “com.aspyr.kotor” family
+    /// (Mac App Store com.aspyr.kotor and com.aspyr.kotor.appstore, other com.aspyr.kotor.*
+    /// releases); the App Store identifiers are also the container names in `SaveDiscovery`.
+    /// Each game's launcher runs the engine as a second executable in the same bundle, which
+    /// reports the same identifier.
+    public init?(bundleIdentifier: String) {
+        let id = bundleIdentifier.lowercased()
+        // TSL first: its identifiers also start with "com.aspyr.kotor".
+        if id.hasPrefix("com.aspyr.kotor2") {
+            self = .kotor2
+        } else if id == "com.aspyr.kotor" || id.hasPrefix("com.aspyr.kotor.") {
+            self = .kotor1
+        } else {
+            return nil
+        }
+    }
+
     public var title: String {
         switch self {
         case .kotor1: "Knights of the Old Republic"
@@ -41,6 +60,10 @@ public enum Game: String, Codable, CaseIterable, Sendable, Identifiable {
     public var hasCraftingResources: Bool { self == .kotor2 }
     public var hasSecondWeaponSet: Bool { self == .kotor2 }
     public var hasItemUpgradeSlots: Bool { self == .kotor2 }
+
+    /// The level cap of the unmodified game, for when its exptable.2da can't be read
+    /// (`GameData.maximumLevel`).
+    public var maximumLevel: Int { self == .kotor1 ? 20 : 50 }
 
     /// HMAC-SHA1 keys the Xbox releases use to sign save files.
     public var signatureKey: [UInt8] {

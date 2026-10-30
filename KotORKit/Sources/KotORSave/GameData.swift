@@ -164,6 +164,9 @@ public final class GameData: Sendable {
     public let powers: [Int: AbilityInfo]
     public let baseItems: [Int: BaseItemInfo]
     public let quests: [String: QuestInfo]
+    /// The level cap: the last level exptable.2da gives a reachable XP threshold, else the
+    /// game's standard cap.
+    public let maximumLevel: Int
 
     let talkTable: TalkTable?
     let keyArchive: KeyArchive?
@@ -215,6 +218,7 @@ public final class GameData: Sendable {
         powers = loader.abilities("spells", icon: "iconresref") { $0.hasPrefix("FORCE_POWER") && !$0.contains("XXX") }
         baseItems = loader.baseItems()
         quests = loader.quests(encoding: encoding)
+        maximumLevel = loader.levelCap() ?? game.maximumLevel
         assets = GameAssets(key: key, overrides: overrides, root: root, talk: talk, encoding: encoding)
     }
 
@@ -454,6 +458,18 @@ struct TableLoader {
             result[row] = AbilityInfo(id: row, label: label, name: title, icon: table.string(row, icon), isCommon: common(label))
         }
         return result
+    }
+
+    /// exptable.2da lists the XP each level needs and ends with an unreachable 0xFFFFFFFF row
+    /// (level 21 in KotOR, 51 in The Sith Lords); the level before it is the cap.
+    func levelCap() -> Int? {
+        guard let table = table("exptable") else { return nil }
+        let reachable = (0 ..< table.rowCount).compactMap { row -> Int? in
+            guard let xp = table.int(row, "xp"), (0 ..< 0xFFFF_FFFF).contains(xp) else { return nil }
+            return table.int(row, "level") ?? row + 1
+        }
+        guard let cap = reachable.max(), cap > 0 else { return nil }
+        return cap
     }
 
     func baseItems() -> [Int: BaseItemInfo] {

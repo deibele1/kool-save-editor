@@ -86,12 +86,13 @@ struct VersionsView: View {
             .contextMenu(forSelectionType: String.self) { ids in
                 if let version = rows.first(where: { ids.contains($0.id) })?.version {
                     Button("Restore This Version…") { restoring = version }
+                        .disabled(isGameRunning)
                     Button("Show in Finder") { reveal(version) }
                     Divider()
                     Button("Delete Version…", role: .destructive) { deleting = version }
                 }
             } primaryAction: { ids in
-                restoring = rows.first { ids.contains($0.id) }?.version
+                if !isGameRunning { restoring = rows.first { ids.contains($0.id) }?.version }
             }
             .overlay {
                 if rows.isEmpty {
@@ -101,7 +102,8 @@ struct VersionsView: View {
             }
             HStack {
                 Button("Restore…") { restoring = selected }
-                    .disabled(selected == nil)
+                    .disabled(selected == nil || isGameRunning)
+                    .help(isGameRunning ? "Quit \(document.game.title) before restoring: it would overwrite the save" : "")
                 Button("Show in Finder") { if let selected { reveal(selected) } }
                     .disabled(selected == nil)
                 Button("Delete…", role: .destructive) { deleting = selected }
@@ -124,7 +126,9 @@ struct VersionsView: View {
             Button("Restore") { document.restore(version, using: model) }
         } message: { version in
             let changes = version.changes.map { $0 == SaveVersion.noChanges ? "" : " (\($0))" } ?? ""
-            Text("The save goes back to \(version.title)\(changes), saved \(version.savedDate.formatted(date: .abbreviated, time: .shortened)). The current save is kept as a new version first, so you can switch back\(document.isDirty ? ", but unsaved edits are discarded" : "").")
+            let player = model.versionStore.restoreKeepsCurrentPlayer(version, to: document.summary.folder)
+                ? " This version was kept before Kool Save Editor backed up pifo.ifo, so the restored autosave keeps the character it has now." : ""
+            Text("The save goes back to \(version.title)\(changes), saved \(version.savedDate.formatted(date: .abbreviated, time: .shortened)).\(player) The current save is kept as a new version first, so you can switch back\(document.isDirty ? ", but unsaved edits are discarded" : "").")
         }
         .confirmationDialog(deleting.map { "Delete “\($0.title)”?" } ?? "",
                             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
@@ -136,6 +140,9 @@ struct VersionsView: View {
                 : "This version can no longer be restored.")
         }
     }
+
+    /// Restoring writes the save, which waits until its game has quit.
+    private var isGameRunning: Bool { model.isGameRunning(document.game) }
 
     static func shortDate(_ date: Date) -> String {
         let thisYear = Calendar.current.isDate(date, equalTo: .now, toGranularity: .year)

@@ -106,6 +106,61 @@ struct CharacterHeader: View {
     }
 }
 
+/// Why edits to a sheet may not reach the game: it goes on with another copy of the character,
+/// which Kool Save Editor can't edit yet.
+struct CopyNotice: Hashable {
+    var title: String
+    var detail: String
+}
+
+extension SaveDocument {
+    func copyNotices(for character: CharacterID) -> [CopyNotice] {
+        guard let save else { return [] }
+        var notices: [CopyNotice] = []
+        switch character {
+        case .player:
+            if save.isPCAutosave {
+                notices.append(CopyNotice(title: "This autosave keeps the current character in pifo.ifo, which Kool Save Editor can’t edit yet.",
+                                          detail: "This sheet shows an older copy, so edits to it won’t reach the game. Edit a manual save or quicksave instead."))
+            }
+            if let index = save.controlledCompanion {
+                // TSL keeps the player character in pc.utc; don't name a file this save doesn't have.
+                let separately = save.archive.index(of: "pc", type: .utc) != nil ? "separately (pc.utc)" : "separately"
+                notices.append(CopyNotice(title: "In this save you are controlling \(companionName(index)).",
+                                          detail: "This sheet is that companion’s copy, and your own character is stored \(separately) and can’t be edited here yet."))
+            }
+        case .npc(let index):
+            if save.companionsInArea.contains(index) {
+                notices.append(CopyNotice(title: "\(companionName(index)) is standing in the current area of this save (for example aboard the Ebon Hawk).",
+                                          detail: "The game uses that copy, so edits to this sheet will most likely be ignored and then overwritten. Edit a save made in another area instead."))
+            }
+        }
+        return notices
+    }
+}
+
+/// The character's copy notices, in the style of `GameDataNotice`. Shown on every tab: at the top
+/// of forms, below lists and tables (wrapping text above a table breaks the window's layout).
+struct CharacterCopyNotice: View {
+    let document: SaveDocument
+    let character: CharacterID
+
+    var body: some View {
+        ForEach(document.copyNotices(for: character), id: \.self) { notice in
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(notice.title).font(.callout.weight(.medium))
+                    Text(notice.detail).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.yellow.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
 struct CharacterGeneralView: View {
     let document: SaveDocument
     let character: CharacterID
@@ -135,6 +190,9 @@ struct CharacterGeneralView: View {
         if let save = document.save, let creature = save.creature(character) {
             let data = document.gameData
             Form {
+                if !document.copyNotices(for: character).isEmpty {
+                    Section { CharacterCopyNotice(document: document, character: character) }
+                }
                 Section("Identity") {
                     CommitTextField(title: "Name", value: data?.text(creature.firstName) ?? "", encoding: save.encoding) { name in
                         document.edit("Rename Character") { save in
@@ -339,33 +397,45 @@ struct InfluenceRow: View {
     let document: SaveDocument
     let index: Int
     let title: String
+    /// Changed to show the stored value again when the field is cleared, which edits nothing.
+    @State private var fieldReset = 0
 
     var body: some View {
-        let value = document.save?.influence(index)
+        let stored = document.save?.influence(index)
+        // The game stores −1 until a companion joins: no value, like a missing entry.
+        let value = stored.flatMap { $0 < 0 ? nil : $0 }
+        let range = SaveGame.influenceRange
         LabeledContent {
             HStack {
-                Slider(value: Binding(
-                    get: { Double(value ?? 50) },
-                    set: { newValue in
-                        let rounded = Int(newValue.rounded())
-                        guard rounded != document.save?.influence(index) else { return }
-                        document.edit("Change Influence") { $0.setInfluence(index, rounded) }
-                    }), in: 0 ... 100)
+                Slider(value: Binding(get: { Double(value ?? 50) }, set: { update(Int($0.rounded()), shown: value) }),
+                       in: Double(range.lowerBound) ... Double(range.upperBound))
                     .frame(maxWidth: 260)
-                TextField(title, value: Binding(
-                    get: { value ?? 50 },
-                    set: { newValue in document.edit("Change Influence") { $0.setInfluence(index, newValue) } }),
-                          format: .number)
+                    .opacity(value == nil ? 0.5 : 1)
+                TextField(title, value: Binding(get: { value }, set: {
+                    if let newValue = $0 { update(newValue, shown: value) } else if value != nil { fieldReset += 1 }
+                }), format: .number, prompt: Text("—"))
+                    .id(fieldReset)
                     .labelsHidden()
                     .multilineTextAlignment(.trailing)
                     .frame(width: 56)
             }
         } label: {
             Text(title)
-            if value == nil {
+            if stored == nil {
                 Text("Not recorded yet").font(.caption).foregroundStyle(.secondary)
+            } else if value == nil {
+                Text("Not joined yet").font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    /// Records an edit only for a new value: the field sets its value again when it gains or
+    /// loses focus, which must not edit the save. Values are clamped to 0…100.
+    private func update(_ newValue: Int, shown: Int?) {
+        let range = SaveGame.influenceRange
+        let clamped = min(max(newValue, range.lowerBound), range.upperBound)
+        guard newValue != shown, clamped != document.save?.influence(index) else { return }
+        document.edit("Change Influence") { $0.setInfluence(index, clamped) }
     }
 }
 
@@ -425,23 +495,41 @@ struct AbilitiesView: View {
 
     var body: some View {
         if let creature = document.save?.creature(character) {
+            let maxScore = Creature.maximumAbilityScore, maxRank = Creature.maximumSkillRank
             Form {
-                Section("Attributes") {
+                if !document.copyNotices(for: character).isEmpty {
+                    Section { CharacterCopyNotice(document: document, character: character) }
+                }
+                Section {
                     ForEach(Ability.allCases) { ability in
                         let score = creature[ability]
-                        NumberField(title: "\(ability.title) (\(modifier(score)))",
+                        // Above the cap the game's total depends on the bonuses, so no modifier is shown.
+                        NumberField(title: score > maxScore ? ability.title : "\(ability.title) (\(modifier(score)))",
                                     value: document.creatureBinding(character, "Change \(ability.title)", \.[ability]),
-                                    range: 0 ... 255)
+                                    range: 0 ... maxScore,
+                                    warning: score > maxScore ? "Above \(maxScore), item and Force bonuses can wrap the game’s total around to a small number." : nil)
                     }
+                } header: {
+                    Text("Attributes")
+                } footer: {
+                    Text("Attributes go up to \(maxScore), which leaves room for item and Force bonuses: the game can’t count an attribute past 255, and a higher total wraps around to a small number.")
+                        .foregroundStyle(.secondary)
                 }
-                Section("Skills") {
+                Section {
                     ForEach(Array(creature.skillRanks.enumerated()), id: \.offset) { skill, rank in
+                        let read = Int(Int8(truncatingIfNeeded: rank))
                         NumberField(title: document.gameData?.skillName(skill) ?? "Skill \(skill)",
                                     value: document.binding("Change \(document.gameData?.skillName(skill) ?? "Skill")",
                                                             { $0.creature(character)?.skillRanks[safe: skill] ?? rank },
                                                             { save, value in save.updateCreature(character) { $0.setSkillRank(skill, value) } }),
-                                    range: 0 ... 255)
+                                    range: 0 ... maxRank,
+                                    warning: rank > maxRank ? "The game reads \(rank) as \(read < 0 ? "−\(-read)" : "\(read)")." : nil)
                     }
+                } header: {
+                    Text("Skills")
+                } footer: {
+                    Text("Ranks go up to \(maxRank): the game reads higher ranks as negative numbers.")
+                        .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)

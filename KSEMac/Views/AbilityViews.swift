@@ -47,6 +47,7 @@ struct FeatsView: View {
                 Spacer()
                 Text("\(feats.count) feats").foregroundStyle(.secondary)
             }
+            CharacterCopyNotice(document: document, character: character)
             GameDataNotice(gameData: data)
         }
         .padding(.top, 8)
@@ -124,6 +125,7 @@ struct PowersView: View {
                     }
                 }
             }
+            CharacterCopyNotice(document: document, character: character)
             GameDataNotice(gameData: data)
         }
         .padding(.top, 8)
@@ -211,9 +213,14 @@ struct ClassesView: View {
     @State private var selection: Int?
 
     var body: some View {
-        let classes = document.save?.creature(character)?.classes ?? []
+        let creature = document.save?.creature(character)
+        let classes = creature?.classes ?? []
         let data = document.gameData
-        let available = (data?.classes.values.map { $0 } ?? []).sorted { $0.name < $1.name }
+        // The games refuse a creature with the same class twice, so classes it has aren't offered.
+        let owned = Set(classes.map(\.classID))
+        let available = (data?.classes.values.filter { !owned.contains($0.id) } ?? []).sorted { $0.name < $1.name }
+        let canAdd = classes.count < Creature.maximumClassCount
+        let levelCap = data?.maximumLevel ?? document.game.maximumLevel
         VStack(alignment: .leading, spacing: 10) {
             Table(classes, selection: $selection) {
                 TableColumn("Class") { entry in
@@ -223,7 +230,7 @@ struct ClassesView: View {
                     Stepper(value: document.binding("Change Class Level",
                                                     { $0.creature(character)?.classes[safe: entry.index]?.level ?? entry.level },
                                                     { save, level in save.updateCreature(character) { $0.setClassLevel(entry.index, level) } }),
-                            in: 1 ... 50) {
+                            in: 1 ... (creature?.levelLimit(forClass: entry.index, cap: levelCap) ?? levelCap)) {
                         Text("\(entry.level)").monospacedDigit()
                     }
                 }
@@ -242,7 +249,8 @@ struct ClassesView: View {
                     }
                 }
                 .fixedSize()
-                .disabled(available.isEmpty)
+                .disabled(available.isEmpty || !canAdd)
+                .help(canAdd ? "" : "A character can have at most two classes.")
                 Menu("Change Class") {
                     ForEach(available) { info in
                         Button(info.name) {
@@ -263,9 +271,10 @@ struct ClassesView: View {
                 .disabled(selection == nil || classes.count <= 1)
                 Spacer()
             }
-            Text("KotOR characters normally have at most two classes. Changing to a Force-using class adds an empty power list; changing away from one removes its powers.")
+            Text("Changing a class level doesn’t level up the character: no vitality, skills, feats or powers are granted. Characters have at most two different classes, up to level \(levelCap) in all. Changing to a Force-using class adds an empty power list; changing away from one removes its powers.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            CharacterCopyNotice(document: document, character: character)
             GameDataNotice(gameData: data)
         }
         .padding(.top, 8)

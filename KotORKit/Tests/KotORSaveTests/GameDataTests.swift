@@ -31,6 +31,13 @@ struct GameDataTests {
         #expect(data.itemIcon(baseItem: 0, modelVariation: 1) == "iw_brifle_001")
     }
 
+    @Test func theLevelCapComesFromTheExperienceTable() throws {
+        // The fixture's exptable.2da ends like the games' with an unreachable row (0xFFFFFFFF).
+        #expect(try install().maximumLevel == 3)
+        #expect(GameData(game: .kotor1, root: nil).maximumLevel == 20)
+        #expect(GameData(game: .kotor2, root: nil).maximumLevel == 50)
+    }
+
     @Test func overrideFolderTakesPrecedence() throws {
         let data = try install()
         #expect(data.appearanceName(0) == "PMBOverride")
@@ -208,5 +215,18 @@ struct DiscoveryTests {
         let folders = [home.appendingPathComponent("Applications")]
         #expect(SaveDiscovery.gameDataCandidates(for: .kotor2, home: home, applicationFolders: folders) == [steam.standardizedFileURL])
         #expect(SaveDiscovery.gameDataCandidates(for: .kotor1, home: home, applicationFolders: folders) == [apps.standardizedFileURL])
+    }
+
+    @Test func recognizesTheRunningGamesByBundleIdentifier() {
+        // Steam and Mac App Store releases, including the App Store container names.
+        for id in ["com.aspyr.kotor2.steam", "com.aspyr.kotor2.appstore", "com.aspyr.kotor2", "COM.Aspyr.KOTOR2.Steam"] {
+            #expect(Game(bundleIdentifier: id) == .kotor2, "\(id)")
+        }
+        for id in ["com.aspyr.kotor", "com.aspyr.kotor.appstore", "com.aspyr.kotor.steam", "com.Aspyr.KotOR"] {
+            #expect(Game(bundleIdentifier: id) == .kotor1, "\(id)")
+        }
+        for id in ["", "com.aspyr", "com.aspyr.kotorremake", "com.aspyr.civ6", "com.valvesoftware.steam", "Sempervia.KSEMac"] {
+            #expect(Game(bundleIdentifier: id) == nil, "\(id)")
+        }
     }
 }

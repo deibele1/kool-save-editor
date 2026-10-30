@@ -16,7 +16,7 @@ public enum CommitError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .externallyModified(let files):
-            "The save was changed outside the editor (\(files.joined(separator: ", "))). Reload it, or save anyway to overwrite those changes."
+            "The save was changed outside the editor (\(files.joined(separator: ", "))). Reload it, or replace it with your version; the changed save is kept as a version first."
         case .invalidOutput(let file, let reason):
             "Nothing was written: the new \(file) failed validation (\(reason))."
         case .writeFailed(let file, let reason, let rolledBack):
@@ -36,23 +36,41 @@ public struct CommitResult: Sendable {
 }
 
 public enum SaveWriter {
+    /// Writes the files of `save` that differ from `baseline`, the save as last read. With
+    /// `overwriteExternalChanges`, a save changed outside the editor is replaced as a whole, not
+    /// mixed with the editor's files: every file is written (the save as read plus the edits)
+    /// and save files that appeared since it was read are removed. The snapshot taken before
+    /// writing keeps the replaced save.
     public static func commit(_ save: SaveGame, baseline: SaveGame, store: SaveVersionStore, summary: String,
                               retention: Int = 25, overwriteExternalChanges: Bool = false,
                               beforeWriting: ((String) throws -> Void)? = nil) throws -> CommitResult {
-        var files = save.changedFiles(since: baseline)
+        // Edits never change LASTMODULE, and SAVEGAME.sav is rebuilt from the baseline's copy of
+        // that module, so a save naming another module can't be written over this one.
+        guard save.moduleResRef.lowercased() == baseline.moduleResRef.lowercased() else {
+            throw CommitError.invalidOutput(save.fileNames.archive, "it is in another module than the save on disk")
+        }
+        let replacing = overwriteExternalChanges && save.hasChanges(since: baseline)
+        var files = replacing ? save.allFiles(since: baseline) : save.changedFiles(since: baseline)
         guard !files.isEmpty else {
-            return CommitResult(version: nil, writtenFiles: [], reloaded: save)
+            return CommitResult(version: nil, writtenFiles: [], reloaded: baseline)
         }
 
-        if !overwriteExternalChanges {
+        var removed: [String] = []
+        if replacing {
+            let opened = Set(baseline.fingerprints.keys.map { $0.lowercased() })
+            removed = ((try? SaveVersionStore.saveFiles(in: save.folder)) ?? []).filter { !opened.contains($0.lowercased()) }
+        } else {
             let modified = baseline.externallyModifiedFiles()
             if !modified.isEmpty { throw CommitError.externallyModified(modified) }
         }
 
-        for (name, bytes) in files { try validate(name, bytes, save: save) }
+        // Files written back as they were read need no validation.
+        for (name, bytes) in files where baseline.otherFiles[name] == nil { try validate(name, bytes, save: save) }
 
         if !save.fileNames.signatures.isEmpty {
-            for (name, bytes) in XboxSignatures.signatures(for: save, replacing: files) { files[name] = bytes }
+            for (name, bytes) in XboxSignatures.signatures(for: save, replacing: files, removing: removed) { files[name] = bytes }
+            let written = Set(files.keys.map { $0.lowercased() })
+            removed.removeAll { written.contains($0.lowercased()) }
         }
 
         let version = try store.snapshot(save.folder, reason: .beforeSave, summary: summary)
@@ -66,6 +84,13 @@ public enum SaveWriter {
             do {
                 try beforeWriting?(name)
                 try SaveVersionStore.write(Data(files[name]!), to: save.folder.appendingPathComponent(name))
+            } catch {
+                throw CommitError.writeFailed(name, error.localizedDescription, rolledBack: rollback())
+            }
+        }
+        for name in removed {
+            do {
+                try FileManager.default.removeItem(at: save.folder.appendingPathComponent(name))
             } catch {
                 throw CommitError.writeFailed(name, error.localizedDescription, rolledBack: rollback())
             }
@@ -118,9 +143,10 @@ enum XboxSignatures {
         Array(HMAC<Insecure.SHA1>.authenticationCode(for: bytes, using: SymmetricKey(data: key)))
     }
 
-    static func signatures(for save: SaveGame, replacing pending: [String: [UInt8]]) -> [String: [UInt8]] {
+    /// Signs the pending files and the other files on disk, except those about to be `removed`.
+    static func signatures(for save: SaveGame, replacing pending: [String: [UInt8]], removing removed: [String] = []) -> [String: [UInt8]] {
         let folder = save.folder
-        let present = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+        let present = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []).filter { !removed.contains($0) }
         func actualName(_ name: String) -> String? { present.first { $0.lowercased() == name.lowercased() } }
         func contents(_ name: String) -> [UInt8]? {
             if let pending = pending.first(where: { $0.key.lowercased() == name.lowercased() }) { return pending.value }

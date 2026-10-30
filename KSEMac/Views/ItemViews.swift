@@ -24,6 +24,9 @@ struct EquipmentView: View {
         let creature = document.save?.creature(character)
         let data = document.gameData
         let tokens = document.textTokens
+        // On a sheet the game doesn't use, unequipping or replacing an item would only add a second
+        // copy of it to the party inventory: the copy the game uses keeps wearing it.
+        let unequips = document.save?.gameUsesSheet(character) ?? true
         VStack(alignment: .leading, spacing: 10) {
             List {
                 ForEach(EquipmentSlot.slots(for: document.game)) { slot in
@@ -43,25 +46,32 @@ struct EquipmentView: View {
                         }
                         Spacer()
                         Button(item == nil ? "Equip…" : "Change…") { picking = slot }
-                            .disabled(!(data?.isAvailable ?? false))
+                            .disabled(!(data?.isAvailable ?? false) || (item != nil && !unequips))
+                            .help(item == nil ? "" : unequips
+                                ? "Choose a replacement; the current item goes to the party inventory"
+                                : "The game uses another copy of this character, which keeps wearing the item")
                         Button("Unequip") {
                             document.edit("Unequip \(slot.title)") { $0.unequip(slot, from: character) }
                         }
-                        .disabled(item == nil)
-                        .help("Move the item to the party inventory")
+                        .disabled(item == nil || !unequips)
+                        .help(unequips
+                            ? "Move the item to the party inventory"
+                            : "The game uses another copy of this character, which keeps wearing the item")
                     }
                     .padding(.vertical, 2)
                 }
             }
-            Text("Replacing an item keeps its object ID, as KSE did; an empty slot gets a new ID from the module. Unequipped items go to the party inventory.")
+            Text("Unequipped and replaced items go to the party inventory. A replacement keeps the slot’s object ID, as KSE did; an empty slot gets a new ID from the module.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            CharacterCopyNotice(document: document, character: character)
             GameDataNotice(gameData: data)
         }
         .padding(.top, 8)
         .sheet(item: $picking) { slot in
             if let data {
-                ItemPickerSheet(mode: .equip(slot), gameData: data, tokens: tokens, owned: []) { templates, _ in
+                let replacing = document.save?.creature(character)?.equippedItem(slot).map { tokens.apply(data.itemName($0)) }
+                ItemPickerSheet(mode: .equip(slot, replacing: replacing), gameData: data, tokens: tokens, owned: []) { templates, _ in
                     guard let first = templates.first, let template = data.itemTemplate(first) else { return }
                     document.edit("Equip \(first.name.isEmpty ? first.resRef : tokens.apply(first.name))") {
                         $0.equip(template, slot: slot, on: character)
@@ -75,7 +85,8 @@ struct EquipmentView: View {
 /// Browses every item blueprint: the game's BIFs, the override folder and the modules (level files).
 struct ItemPickerSheet: View {
     enum Mode {
-        case equip(EquipmentSlot)
+        /// `replacing` names the item in the slot, which goes to the party inventory.
+        case equip(EquipmentSlot, replacing: String?)
         case inventory
     }
 
@@ -118,11 +129,12 @@ struct ItemPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private var isEquipping: Bool { if case .equip = mode { true } else { false } }
+    private var replacedItem: String? { if case .equip(_, let replacing) = mode { replacing } else { nil } }
 
     private var visible: [TemplateRow] {
         rows.filter { row in
             let slots = gameData.baseItems[row.template.baseItem]?.equipableSlots ?? 0
-            if case .equip(let slot) = mode, slots & slot.equipBit == 0 { return false }
+            if case .equip(let slot, _) = mode, slots & slot.equipBit == 0 { return false }
             switch filter {
             case .all: break
             case .weapons: if slots & 0x30 == 0 { return false }
@@ -209,11 +221,13 @@ struct ItemPickerSheet: View {
             }
 
             Divider().padding(.top, 8)
-            SheetFooter(confirmTitle: isEquipping ? "Equip" : (selection.count > 1 ? "Add \(selection.count) Items" : "Add"),
+            SheetFooter(confirmTitle: isEquipping ? (replacedItem == nil ? "Equip" : "Replace") : (selection.count > 1 ? "Add \(selection.count) Items" : "Add"),
                         confirmDisabled: selection.isEmpty || (isEquipping && selection.count != 1)) {
                 confirm(selection)
             } leading: {
-                if !isEquipping {
+                if let replacedItem {
+                    Text("\(replacedItem) goes to the party inventory.").font(.caption).foregroundStyle(.secondary)
+                } else if !isEquipping {
                     Stepper("Quantity: \(quantity)", value: $quantity, in: 1 ... 999)
                         .fixedSize()
                     Text("Items you already have are highlighted.").font(.caption).foregroundStyle(.secondary)
@@ -232,7 +246,8 @@ struct ItemPickerSheet: View {
 
     private var title: String {
         switch mode {
-        case .equip(let slot): "Equip \(slot.title)"
+        case .equip(let slot, let replacing?): "Replace \(replacing) (\(slot.title))"
+        case .equip(let slot, nil): "Equip \(slot.title)"
         case .inventory: "Add Items"
         }
     }
@@ -256,7 +271,6 @@ struct InventoryView: View {
     @State private var selection = Set<Int>()
     @State private var adding = Self.opensItemPicker
     @State private var search = ""
-    @State private var confirmPaste = false
 
     private static var opensItemPicker: Bool {
         #if DEBUG
@@ -329,7 +343,7 @@ struct InventoryView: View {
                     .disabled(selection.isEmpty)
                 Spacer()
                 Button("Copy Inventory") { model.copyInventory(from: document) }
-                Button("Paste Inventory…") { confirmPaste = true }
+                Button("Paste Inventory…") { model.requestPasteInventory(into: document) }
                     .disabled(!model.canPasteInventory(into: document))
             }
             GameDataNotice(gameData: data)
@@ -347,11 +361,6 @@ struct InventoryView: View {
                     }
                 }
             }
-        }
-        .confirmationDialog("Replace this inventory?", isPresented: $confirmPaste) {
-            Button("Replace Inventory", role: .destructive) { model.pasteInventory(into: document) }
-        } message: {
-            Text("The inventory of “\(model.inventoryClipboard?.sourceName ?? "")” (\(model.inventoryClipboard?.items.count ?? 0) items) replaces this save’s inventory. You can undo this or revert before saving.")
         }
     }
 

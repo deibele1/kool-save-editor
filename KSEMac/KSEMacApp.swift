@@ -42,10 +42,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? relaunch.run()
     }
 
+    /// Set while the app is in the background; on returning, saves the game wrote meanwhile are read again.
+    private var wasInactive = false
+
+    func applicationDidResignActive(_ notification: Notification) {
+        wasInactive = true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        guard wasInactive else { return }
+        wasInactive = false
+        model?.refresh()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // A name still being typed counts as an unsaved change.
+        model?.commitTyping()
         guard let model, !model.dirtyDocuments.isEmpty else { return .terminateNow }
         let count = model.dirtyDocuments.count
         let alert = NSAlert()
+        // A running game's saves can't be written (it would overwrite them); the other game's still
+        // can. The editor stays open by default, so they can be saved once the game has quit.
+        let blocked = model.dirtyDocuments.filter { model.isGameRunning($0.game) }
+        if !blocked.isEmpty {
+            let others = model.dirtyDocuments.filter { !model.isGameRunning($0.game) }
+            let running = Set(blocked.map(\.game)).count == 1 ? "\(blocked[0].game.title) is" : "Both games are"
+            let changes = blocked.count == 1 ? "the changes you made to “\(blocked[0].summary.name)”" : "your changes in \(blocked.count) saves"
+            alert.messageText = "\(running) running, so \(changes) can’t be saved."
+            alert.informativeText = GameRunningError.advice + (others.isEmpty
+                ? " Your changes will be lost if you don’t save them."
+                : " Your other changes can still be saved, but \(changes) will be lost if you quit now.")
+            alert.addButton(withTitle: "Cancel")
+            if !others.isEmpty { alert.addButton(withTitle: "Save Others and Quit") }
+            alert.addButton(withTitle: "Don’t Save")
+            switch alert.runModal() {
+            case .alertSecondButtonReturn where !others.isEmpty:
+                return quitAfterSaving(others, model: model, sender: sender)
+            case .alertSecondButtonReturn, .alertThirdButtonReturn:  // Don’t Save
+                return .terminateNow
+            default:
+                Self.relaunchesAfterQuit = false
+                return .terminateCancel
+            }
+        }
         alert.messageText = count == 1
             ? "Do you want to save the changes you made to “\(model.dirtyDocuments[0].summary.name)”?"
             : "You have unsaved changes in \(count) saves. Do you want to save them?"
@@ -55,18 +94,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Don’t Save")
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            Task { @MainActor in
-                let saved = await model.saveAll()
-                if !saved { Self.relaunchesAfterQuit = false }
-                sender.reply(toApplicationShouldTerminate: saved)
-            }
-            return .terminateLater
+            return quitAfterSaving(model: model, sender: sender)
         case .alertThirdButtonReturn:
             return .terminateNow
         default:
             Self.relaunchesAfterQuit = false
             return .terminateCancel
         }
+    }
+
+    /// Quits once `documents` (every edited save by default) are saved, or stays open if one of
+    /// them couldn't be.
+    private func quitAfterSaving(_ documents: [SaveDocument]? = nil, model: AppModel,
+                                 sender: NSApplication) -> NSApplication.TerminateReply {
+        Task { @MainActor in
+            let saved = await model.saveAll(documents)
+            if !saved { Self.relaunchesAfterQuit = false }
+            sender.reply(toApplicationShouldTerminate: saved)
+        }
+        return .terminateLater
     }
 }
 
@@ -80,27 +126,31 @@ struct EditorCommands: Commands {
         CommandGroup(replacing: .saveItem) {
             Button("Save") {
                 guard let document = model.selectedDocument else { return }
+                model.commitTyping()
                 Task { await document.commit(using: model) }
             }
             .keyboardShortcut("s")
-            .disabled(!(model.selectedDocument?.isDirty ?? false))
+            .disabled(!(model.selectedDocument.map { model.hasUnsavedChanges($0) && !$0.isSaving && !model.isGameRunning($0.game) } ?? false))
 
-            Button("Revert to Saved") { model.selectedDocument?.revert() }
-                .disabled(!(model.selectedDocument?.isDirty ?? false))
+            Button("Revert to Saved") {
+                if let document = model.selectedDocument { model.requestRevert(document) }
+            }
+            .disabled(!model.hasUnsavedChanges(model.selectedDocument) || model.selectedDocument?.isSaving == true)
         }
         CommandGroup(replacing: .newItem) {
             Button("Add Saves Folder…") { model.chooseCustomFolder() }
                 .keyboardShortcut("o")
         }
         CommandMenu("Savegame") {
+            // The harmless refresh gets ⌘R; reloading can discard edits (it asks first).
             Button("Reload from Disk") {
-                if let document = model.selectedDocument { document.reload(using: model) }
+                if let document = model.selectedDocument { model.requestReload(document) }
             }
-            .keyboardShortcut("r")
+            .keyboardShortcut("r", modifiers: [.command, .shift])
             .disabled(model.selectedDocument == nil)
 
             Button("Refresh Save List") { model.refresh() }
-                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .keyboardShortcut("r")
 
             Divider()
 
@@ -109,8 +159,8 @@ struct EditorCommands: Commands {
             }
             .disabled(!(model.selectedDocument?.isReady ?? false))
 
-            Button("Paste Inventory") {
-                if let document = model.selectedDocument { model.pasteInventory(into: document) }
+            Button("Paste Inventory…") {
+                if let document = model.selectedDocument { model.requestPasteInventory(into: document) }
             }
             .disabled(!model.canPasteInventory(into: model.selectedDocument))
 

@@ -26,7 +26,7 @@ struct SummaryView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(save.saveName.isEmpty ? document.summary.folderName : save.saveName).font(.title2.bold())
                             Text(save.areaName).font(.title3).foregroundStyle(.secondary)
-                            Text(document.name(of: .player)).foregroundStyle(.secondary)
+                            Text(document.playerTitle).foregroundStyle(.secondary)
                             Spacer(minLength: 8)
                             Text("Modified \(document.summary.modified.formatted(date: .abbreviated, time: .shortened))")
                                 .font(.callout)

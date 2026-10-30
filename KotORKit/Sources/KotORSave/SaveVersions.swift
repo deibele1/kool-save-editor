@@ -6,6 +6,7 @@
 // manifest of file sizes and SHA-256 digests. On APFS the copies are clones and cost
 // almost no space until the save changes.
 
+import Aurora
 import CryptoKit
 import Foundation
 
@@ -43,6 +44,9 @@ public struct SaveVersion: Sendable, Hashable, Identifiable, Codable {
     public var modified: Date?
     /// The game's play time counter (savenfo.res TIMEPLAYED, seconds) as of the snapshot.
     public var timePlayed: Int?
+    /// The kinds of file (extensions) the snapshot kept; nil for snapshots from builds that kept
+    /// only .res, .sav, .tga and .sig files, without an autosave's pifo.ifo.
+    public var extensions: [String]?
     /// Labels written by an earlier build ("Original", "After: …"); read to derive `changes`.
     public var state: String?
     public var restoring: String?
@@ -56,6 +60,13 @@ public struct SaveVersion: Sendable, Hashable, Identifiable, Codable {
     public var totalSize: Int { files.reduce(0) { $0 + $1.size } }
 
     static func title(number: Int) -> String { number == 1 ? "Original" : "Version \(number)" }
+
+    /// Whether the snapshot kept files of this kind, so its file list tells whether one was there.
+    func keeps(_ name: String) -> Bool {
+        let kind = (name as NSString).pathExtension.lowercased()
+        guard let extensions else { return SaveVersionStore.legacyExtensions.contains(kind) }
+        return extensions.contains { $0.lowercased() == kind }
+    }
 
     /// What the save or restore that followed this snapshot changed.
     var outcome: String {
@@ -110,7 +121,10 @@ public struct SaveVersionStore: Sendable {
         return support.appendingPathComponent("KSEMac/Versions", isDirectory: true)
     }
 
-    static let managedExtensions: Set<String> = ["res", "sav", "tga", "sig"]
+    /// The save files snapshots keep. .ifo is a transition autosave's pifo.ifo, which the game
+    /// loads the player from; earlier builds kept only `legacyExtensions`.
+    static let managedExtensions: Set<String> = ["res", "sav", "tga", "sig", "ifo"]
+    static let legacyExtensions: Set<String> = ["res", "sav", "tga", "sig"]
     static let manifestName = "version.json"
 
     /// The directory holding every snapshot of one save folder.
@@ -171,6 +185,8 @@ public struct SaveVersionStore: Sendable {
     /// from the newest version before it.
     static func changes(of files: [SaveVersion.File], timePlayed: Int?, following previous: SaveVersion?) -> String {
         guard let previous else { return SaveVersion.noChanges }
+        // Only the kinds of file the previous version kept (older ones lack pifo.ifo) can differ.
+        let files = files.filter { previous.keeps($0.name) }
         if let result = previous.result, sameFiles(files, result) { return previous.outcome }
         // Unchanged since the snapshot: the operation after it failed and was rolled back.
         if sameFiles(files, previous.files) { return SaveVersion.noChanges }
@@ -226,7 +242,7 @@ public struct SaveVersionStore: Sendable {
                                       number: (previous?.number ?? 0) + 1,
                                       changes: Self.changes(of: records, timePlayed: info?.timePlayed, following: previous),
                                       restoringNumber: restoring, result: nil, modified: modified,
-                                      timePlayed: info?.timePlayed)
+                                      timePlayed: info?.timePlayed, extensions: Self.managedExtensions.sorted())
             try Self.encoder().encode(version).write(to: staging.appendingPathComponent(Self.manifestName))
             try fm.moveItem(at: staging, to: destination)
             return version
@@ -267,7 +283,9 @@ public struct SaveVersionStore: Sendable {
         }
     }
 
-    /// Makes the save's files identical to the snapshot without taking a new snapshot.
+    /// Makes the save's files identical to the snapshot without taking a new snapshot. Files of a
+    /// kind the snapshot didn't keep are left alone: a version from an earlier build can't tell
+    /// whether the autosave had a pifo.ifo, and the game loads a transition autosave's player from it.
     func restoreFiles(of version: SaveVersion, to save: URL) throws {
         let fm = FileManager.default
         let base = location(of: version, for: save)
@@ -275,9 +293,20 @@ public struct SaveVersionStore: Sendable {
             try Self.replace(save.appendingPathComponent(file.name), withContentsOf: base.appendingPathComponent(file.name))
         }
         let kept = Set(version.files.map { $0.name.lowercased() })
-        for name in try Self.saveFiles(in: save) where !kept.contains(name.lowercased()) {
+        for name in try Self.saveFiles(in: save) where !kept.contains(name.lowercased()) && version.keeps(name) {
             try fm.removeItem(at: save.appendingPathComponent(name))
         }
+    }
+
+    /// Whether restoring `version` leaves the save's current pifo.ifo next to the version's older
+    /// files: it is a transition autosave (savenfo PCAUTOSAVE) kept by an earlier build, which
+    /// didn't back up pifo.ifo, so the restored autosave goes on with the player it has now.
+    public func restoreKeepsCurrentPlayer(_ version: SaveVersion, to save: URL) -> Bool {
+        guard !version.keeps("pifo.ifo"), FileManager.default.caseInsensitiveItem(named: "pifo.ifo", in: save) != nil,
+              let info = version.files.first(where: { $0.name.lowercased() == "savenfo.res" }),
+              let kept = try? GFFDocument(data: Data(contentsOf: location(of: version, for: save).appendingPathComponent(info.name)))
+        else { return false }
+        return (kept.root.integer("PCAUTOSAVE") ?? 0) != 0
     }
 
     public func delete(_ version: SaveVersion, for save: URL) throws {

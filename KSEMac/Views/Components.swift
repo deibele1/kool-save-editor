@@ -2,9 +2,12 @@ import Aurora
 import KotORSave
 import SwiftUI
 
-/// A text field that reports its value when editing ends (Return or losing focus), so a
-/// rename is one undoable change rather than one per keystroke.
+/// A text field that reports its value when editing ends (Return, losing focus or the field
+/// going away), so a rename is one undoable change rather than one per keystroke. The text
+/// goes to the save and character it was typed for, and Save, Revert, Reload and Quit apply
+/// it first (`AppModel.commitTyping`).
 struct CommitTextField: View {
+    @Environment(AppModel.self) private var model
     let title: String
     let value: String
     var prompt: String?
@@ -12,15 +15,35 @@ struct CommitTextField: View {
     let commit: (String) -> Void
 
     @State private var text = ""
+    @State private var typed: TypedText?
     @FocusState private var focused: Bool
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 2) {
             TextField(title, text: $text, prompt: prompt.map { Text($0) })
                 .focused($focused)
-                .onSubmit(save)
-                .onChange(of: focused) { _, isFocused in if !isFocused { save() } }
-                .onChange(of: value, initial: true) { _, newValue in if !focused { text = newValue } }
+                .onSubmit {
+                    finish()
+                    focused = false
+                }
+                .onChange(of: focused) { _, isFocused in if !isFocused { finish() } }
+                .onChange(of: text) { _, newText in
+                    if let typed, !typed.isFinished {
+                        typed.text = newText
+                    } else if newText != value {
+                        let typed = TypedText(original: value, text: newText, apply: commit) { focused = false }
+                        self.typed = typed
+                        model.beginTyping(typed)
+                    }
+                }
+                // Undo, Revert and Reload show at once, even while the field has focus, unless
+                // the user has typed something else since.
+                .onChange(of: value, initial: true) { _, newValue in
+                    guard typed?.isEdited != true else { return }
+                    finish()
+                    text = newValue
+                }
+                .onDisappear(perform: finish)
             if let encoding, !encoding.canEncode(text) {
                 Text("Some characters can’t be stored by the game and will be replaced.")
                     .font(.caption)
@@ -29,18 +52,54 @@ struct CommitTextField: View {
         }
     }
 
-    private func save() {
-        if text != value { commit(text) }
+    /// Applies what was typed, if it changes anything; otherwise shows the stored value again.
+    private func finish() {
+        guard let typed else { return }
+        self.typed = nil
+        let applies = typed.isEdited
+        model.finishTyping(typed)
+        if !applies { text = value }
     }
 }
 
-/// An integer field with a stepper, clamped to `range`.
+/// Text typed into a `CommitTextField` and not applied yet. `apply` is the field's action from
+/// when typing started, so the text reaches that save and character even if the field shows
+/// another one by the time editing ends.
+final class TypedText {
+    let original: String
+    var text: String
+    private let apply: (String) -> Void
+    private let endEditing: () -> Void
+    private(set) var isFinished = false
+
+    init(original: String, text: String, apply: @escaping (String) -> Void, endEditing: @escaping () -> Void) {
+        self.original = original
+        self.text = text
+        self.apply = apply
+        self.endEditing = endEditing
+    }
+
+    /// Whether finishing changes the save.
+    var isEdited: Bool { !isFinished && text != original }
+
+    func finish(endingEditing: Bool) {
+        guard !isFinished else { return }
+        let edited = isEdited
+        isFinished = true
+        if edited { apply(text) }
+        if endingEditing { endEditing() }
+    }
+}
+
+/// An integer field with a stepper, clamped to `range`. `warning` is shown under the title,
+/// e.g. for a value the save already holds outside the range.
 struct NumberField: View {
     let title: String
     @Binding var value: Int
     var range: ClosedRange<Int> = 0 ... Int(Int32.max)
     var step = 1
     var help: String?
+    var warning: String?
 
     var body: some View {
         LabeledContent {
@@ -54,12 +113,17 @@ struct NumberField: View {
             }
         } label: {
             Text(title)
+            if let warning {
+                Text(warning).font(.caption).foregroundStyle(.orange)
+            }
         }
         .help(help ?? "")
     }
 
+    /// The field sets its value again when it gains or loses focus; an unchanged value is
+    /// ignored so that alone never clamps (and edits) a value outside the range.
     private var clamped: Binding<Int> {
-        Binding(get: { value }, set: { value = min(max($0, range.lowerBound), range.upperBound) })
+        Binding(get: { value }, set: { if $0 != value { value = min(max($0, range.lowerBound), range.upperBound) } })
     }
 }
 
@@ -295,5 +359,23 @@ struct GameDataNotice: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.yellow.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
         }
+    }
+}
+
+/// Shown above a save while its game runs; saving waits until the game quits.
+struct GameRunningNotice: View {
+    let game: Game
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(game.title) is running.").font(.callout.weight(.medium))
+                Text(GameRunningError.advice).font(.callout).foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.yellow.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
     }
 }

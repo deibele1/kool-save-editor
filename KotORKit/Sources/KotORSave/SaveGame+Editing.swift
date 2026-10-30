@@ -6,7 +6,11 @@
 // changing or deleting every item sharing it); the time played is mirrored into
 // PT_PLAYEDSECONDS and the party size into PT_NUM_MEMBERS; TSL's savenfo PCNAME is
 // updated (KSE looked for it in the party table); quests start at their first journal
-// entry instead of a fixed state 10.
+// entry instead of a fixed state 10; party changes keep the members' leader flags, and the
+// party is locked while the player plays as a companion or the story locks it; global
+// numbers are the signed bytes (−128…127) the games' scripts use; influence stays within 0…100;
+// equipping over an item moves that item to the party inventory (KSE overwrote it, losing it
+// and its upgrades).
 
 import Aurora
 import Foundation
@@ -48,6 +52,10 @@ public struct InventoryItem: Sendable, Hashable, Identifiable {
 public struct PartyMember: Sendable, Hashable, Identifiable {
     public var index: Int
     public var isAvailable: Bool
+    /// False when the story keeps the companion in or out of the party (PT_NPC_SELECT 0).
+    public var isSelectable: Bool
+    /// The companion the player is playing as (see `SaveGame.controlledCompanion`).
+    public var isControlled: Bool
     public var isInParty: Bool
     public var influence: Int?
     public var id: Int { index }
@@ -86,9 +94,31 @@ extension SaveGame {
 
     public var companionIndices: [Int] { npcs.keys.sorted() }
 
-    /// The player's name everywhere the game stores it.
+    /// Whether the game goes on with this sheet. It doesn't with a transition autosave's player
+    /// sheet (the current player is in pifo.ifo) or the sheet of a companion standing in the area.
+    public func gameUsesSheet(_ character: CharacterID) -> Bool {
+        switch character {
+        case .player: !isPCAutosave
+        case .npc(let index): !companionsInArea.contains(index)
+        }
+    }
+
+    /// Whether the player sheet is the player character as the game goes on with it, not a
+    /// transition autosave's older copy or a controlled companion's copy.
+    public var playerSheetIsCurrent: Bool { !isPCAutosave && controlledCompanion == nil }
+
+    /// The player's name as the party table (PT_PCNAME) or TSL's savenfo (PCNAME) keeps it.
+    public var storedPlayerName: String? {
+        [party.root.string("PT_PCNAME", encoding: encoding), info.root.string("PCNAME", encoding: encoding)]
+            .compactMap { $0 }.first { !$0.isEmpty }
+    }
+
+    /// The player's name everywhere the game stores it. When the player sheet is another copy
+    /// (`playerSheetIsCurrent` is false), only the sheet is renamed: the game would go on with
+    /// the old name, so the player keeps it (PT_PCNAME, PCNAME).
     public mutating func setPlayerName(_ name: String) {
         updateCreature(.player) { $0.setFirstName(name) }
+        guard playerSheetIsCurrent else { return }
         if party.root.has("PT_PCNAME") { party.root.setString("PT_PCNAME", name, encoding: encoding) }
         if info.root.has("PCNAME") { info.root.setString("PCNAME", name, encoding: encoding) }
     }
@@ -147,18 +177,26 @@ extension SaveGame {
     public static let maximumPartySize = 2
 
     /// Replaces the active party (at most two companions), as KSE's Current Party panel did.
+    /// Members that stay keep their entries and order, including the leader flag (the
+    /// companion the player was steering); new members follow them. PT_CONTROLLED_NP is
+    /// never touched: it names who the player is playing as, which a party edit can't change.
     public mutating func setPartyMembers(_ ids: [Int]) {
-        let members = Array(ids.prefix(Self.maximumPartySize))
+        var members: [Int] = []
+        for id in ids where !members.contains(id) && members.count < Self.maximumPartySize { members.append(id) }
         party.root.updateList("PT_MEMBERS", create: true) { list in
-            list = members.map {
-                GFFStruct(id: 0, fields: [GFFField(label: "PT_MEMBER_ID", value: .int(Int32(clamping: $0))),
-                                          GFFField(label: "PT_IS_LEADER", value: .byte(0))])
+            var kept: [GFFStruct] = []
+            for entry in list {
+                guard let id = entry.integer("PT_MEMBER_ID"), members.contains(id),
+                      !kept.contains(where: { $0.integer("PT_MEMBER_ID") == id }) else { continue }
+                kept.append(entry)
             }
+            for id in members where !kept.contains(where: { $0.integer("PT_MEMBER_ID") == id }) {
+                kept.append(GFFStruct(id: 0, fields: [GFFField(label: "PT_MEMBER_ID", value: .int(Int32(clamping: id))),
+                                                      GFFField(label: "PT_IS_LEADER", value: .byte(0))]))
+            }
+            list = kept
         }
         if party.root.has("PT_NUM_MEMBERS") { party.root.setInteger("PT_NUM_MEMBERS", members.count, type: .byte) }
-        if let controlled = party.root.integer("PT_CONTROLLED_NP"), controlled >= 0, !members.contains(controlled) {
-            party.root.setInteger("PT_CONTROLLED_NP", -1, type: .int)
-        }
     }
 
     public func isCompanionAvailable(_ index: Int) -> Bool {
@@ -166,12 +204,35 @@ extension SaveGame {
         return (entry.integer("PT_NPC_AVAIL") ?? 0) != 0
     }
 
+    /// False while the story keeps a companion in or out of the party: scripts make them
+    /// unselectable (PT_NPC_SELECT 0), as with Mandalore on the Ravager.
+    public func isCompanionSelectable(_ index: Int) -> Bool {
+        guard let entry = party.root.list("PT_AVAIL_NPCS")?[safe: index] else { return false }
+        return (entry.integer("PT_NPC_SELECT") ?? 1) != 0
+    }
+
+    /// Solo mode (PT_SOLOMODE): the story has the party leader go on alone.
+    public var isSoloMode: Bool { (party.root.integer("PT_SOLOMODE") ?? 0) != 0 }
+
+    /// The party is left as the story set it while the player plays as a companion (the player
+    /// sheet is their copy, or the party table's PT_CONTROLLED_NP says so) or in solo mode.
+    public var canChangeParty: Bool {
+        controlledCompanion == nil && (party.root.integer("PT_CONTROLLED_NP") ?? -1) < 0 && !isSoloMode
+    }
+
+    /// Whether a companion may be added to or removed from the party.
+    public func canToggleCompanion(_ index: Int) -> Bool {
+        canChangeParty && isCompanionAvailable(index) && isCompanionSelectable(index)
+    }
+
     /// Every companion slot the party table knows about.
     public var partyMembers: [PartyMember] {
         let slots = max(party.root.list("PT_AVAIL_NPCS")?.count ?? 0, game.standardNPCNames.count)
         let current = Set(partyMemberIDs)
+        let controlled = controlledCompanion
         return (0 ..< slots).map {
-            PartyMember(index: $0, isAvailable: isCompanionAvailable($0), isInParty: current.contains($0), influence: influence($0))
+            PartyMember(index: $0, isAvailable: isCompanionAvailable($0), isSelectable: isCompanionSelectable($0),
+                        isControlled: $0 == controlled, isInParty: current.contains($0), influence: influence($0))
         }
     }
 
@@ -179,16 +240,21 @@ extension SaveGame {
 
     public var supportsInfluence: Bool { game.hasInfluence || party.root.has("PT_INFLUENCE") }
 
-    /// A companion's influence, or nil when the party table has no entry for it yet.
+    /// The influence values the game uses.
+    public static let influenceRange = 0 ... 100
+
+    /// A companion's influence, or nil when the party table has no entry for it yet. The game
+    /// stores −1 for companions who haven't joined yet.
     public func influence(_ npc: Int) -> Int? {
         guard supportsInfluence, let entry = party.root.list("PT_INFLUENCE")?[safe: npc] else { return nil }
         return entry.integer("PT_NPC_INFLUENCE") ?? entry.fields.first?.value.integer
     }
 
-    /// Sets a companion's influence, creating missing PT_INFLUENCE entries (at the game's
-    /// neutral 50) so every companion can be edited, available or not.
+    /// Sets a companion's influence, clamped to `influenceRange`, creating missing PT_INFLUENCE
+    /// entries (at the game's neutral 50) so every companion can be edited, available or not.
     public mutating func setInfluence(_ npc: Int, _ value: Int) {
         guard supportsInfluence, npc >= 0 else { return }
+        let value = min(max(value, Self.influenceRange.lowerBound), Self.influenceRange.upperBound)
         party.root.updateList("PT_INFLUENCE", create: true) { list in
             while list.count <= npc {
                 let template = list.last.map { entry -> GFFStruct in
@@ -207,6 +273,9 @@ extension SaveGame {
 
     // MARK: Global variables
 
+    /// Global numbers are stored as bytes that both games' scripts read as signed.
+    public static let globalNumberRange = Int(Int8.min) ... Int(Int8.max)
+
     public var globalVariables: [GlobalVariable] {
         guard let root = globals?.root else { return [] }
         var result: [GlobalVariable] = []
@@ -220,7 +289,7 @@ extension SaveGame {
         let numbers = root.void("ValNumber") ?? []
         for (index, entry) in (root.list("CatNumber") ?? []).enumerated() {
             result.append(GlobalVariable(kind: .number, index: index, name: entry.string("Name", encoding: encoding) ?? "",
-                                         number: index < numbers.count ? Int(numbers[index]) : 0, text: ""))
+                                         number: index < numbers.count ? Int(Int8(bitPattern: numbers[index])) : 0, text: ""))
         }
         let strings = root.list("ValString") ?? []
         for (index, entry) in (root.list("CatString") ?? []).enumerated() {
@@ -235,9 +304,10 @@ extension SaveGame {
         return (bits[index / 8] >> (7 - UInt8(index % 8))) & 1 == 1
     }
 
+    /// A global number as the scripts see it, in `globalNumberRange` (the byte 0xFF is −1).
     public func globalNumber(_ index: Int) -> Int {
         guard index >= 0, let bytes = globals?.root.void("ValNumber"), index < bytes.count else { return 0 }
-        return Int(bytes[index])
+        return Int(Int8(bitPattern: bytes[index]))
     }
 
     public mutating func setGlobalBoolean(_ index: Int, _ value: Bool) {
@@ -250,11 +320,12 @@ extension SaveGame {
         globals?.root = root
     }
 
+    /// Stores a global number, clamped to `globalNumberRange`, as the byte the scripts read.
     public mutating func setGlobalNumber(_ index: Int, _ value: Int) {
         guard var root = globals?.root, index >= 0 else { return }
         var bytes = root.void("ValNumber") ?? []
         while bytes.count <= index { bytes.append(0) }
-        bytes[index] = UInt8(clamping: value)
+        bytes[index] = UInt8(bitPattern: Int8(clamping: value))
         root["ValNumber"] = .void(bytes)
         globals?.root = root
     }
@@ -380,35 +451,53 @@ extension SaveGame {
         return UInt32(highest + 1)
     }
 
-    /// Equips an item blueprint, replacing what is in the slot. Like KSE, an occupied
-    /// slot keeps its object ID; an empty slot gets a newly allocated one.
+    /// Equips an item blueprint. An item already in the slot goes to the party inventory, as
+    /// `unequip` puts it there, and like KSE the new item keeps the slot's object ID; an empty
+    /// slot gets a newly allocated one.
     public mutating func equip(_ template: GFFDocument, slot: EquipmentSlot, on character: CharacterID) {
-        let existingID = creature(character)?.equippedItem(slot)?.integer("ObjectId").map { UInt32(clamping: $0) }
+        let replaced = creature(character)?.equippedItem(slot)
+        let existingID = replaced?.integer("ObjectId").map { UInt32(clamping: $0) }
         let objectID = existingID ?? allocateObjectID()
         let item = ItemFactory.equippedItem(from: template, game: game, slot: slot, objectID: objectID)
         updateCreature(character) { creature in
             creature.root.updateList("Equip_ItemList", create: true) { list in
                 if let index = list.firstIndex(where: { $0.id == slot.rawValue }) { list[index] = item } else { list.append(item) }
             }
+            // The hand still holds the slot's object ID, now the new item, so CombatInfo keeps
+            // pointing at it; only the name it recorded for the old weapon goes.
+            if let existingID { Self.clearCombatInfo(for: Int(existingID), in: &creature.root, keepingReference: true) }
         }
+        if let replaced { moveToInventory(replaced) }
     }
 
     /// Takes off the item in a slot and puts it in the party inventory.
     public mutating func unequip(_ slot: EquipmentSlot, from character: CharacterID) {
-        guard var item = creature(character)?.equippedItem(slot) else { return }
+        guard let item = creature(character)?.equippedItem(slot) else { return }
         let objectID = item.integer("ObjectId")
         updateCreature(character) { creature in
             creature.root.updateList("Equip_ItemList") { $0.removeAll { $0.id == slot.rawValue } }
-            guard let objectID else { return }
-            creature.root.updateStruct("CombatInfo") { info in
-                for side in ["Left", "Right"] where info.integer("\(side)Equip") == objectID {
-                    info.setInteger("\(side)Equip", 0x7F00_0000, type: .dword)
-                    if info.has("\(side)String") { info.setString("\(side)String", "") }
-                }
-            }
+            if let objectID { Self.clearCombatInfo(for: objectID, in: &creature.root, keepingReference: false) }
         }
+        moveToInventory(item)
+    }
+
+    /// Puts an item that left an equipment slot into the party inventory the way the game keeps
+    /// inventory items (struct ID 0, no object ID); upgrades and properties stay as they are.
+    private mutating func moveToInventory(_ item: GFFStruct) {
+        var item = item
         item.id = 0
         item["ObjectId"] = nil
         updateItems { $0.append(item) }
+    }
+
+    /// Clears what CombatInfo records about the weapon with this object ID in either hand: its
+    /// name, and unless the slot keeps the ID for a replacement, the reference itself.
+    private static func clearCombatInfo(for objectID: Int, in creature: inout GFFStruct, keepingReference: Bool) {
+        creature.updateStruct("CombatInfo") { info in
+            for side in ["Left", "Right"] where info.integer("\(side)Equip") == objectID {
+                if !keepingReference { info.setInteger("\(side)Equip", 0x7F00_0000, type: .dword) }
+                if info.has("\(side)String") { info.setString("\(side)String", "") }
+            }
+        }
     }
 }

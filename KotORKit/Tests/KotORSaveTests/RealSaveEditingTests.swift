@@ -41,8 +41,14 @@ struct RealSaveEditingTests {
         if game == .kotor2 {
             #expect(reloaded.influence(4) == 77)
             #expect(reloaded.components == (baseline.components ?? 0) + 5)
-            #expect(reloaded.party.root.string("PT_PCNAME") == "Tester" || !baseline.party.root.has("PT_PCNAME"))
-            #expect(reloaded.info.root.string("PCNAME") == "Tester" || !baseline.info.root.has("PCNAME"))
+            if baseline.playerSheetIsCurrent {
+                #expect(reloaded.party.root.string("PT_PCNAME") == "Tester" || !baseline.party.root.has("PT_PCNAME"))
+                #expect(reloaded.info.root.string("PCNAME") == "Tester" || !baseline.info.root.has("PCNAME"))
+            } else {
+                // A transition autosave or a save made while controlling a companion: only the sheet is renamed.
+                #expect(reloaded.party.root.string("PT_PCNAME") == baseline.party.root.string("PT_PCNAME"))
+                #expect(reloaded.info.root.string("PCNAME") == baseline.info.root.string("PCNAME"))
+            }
         }
         #expect(reloaded.credits == baseline.credits + 1000)
         #expect(reloaded.creature(.player)?.firstName?.text(encoding: .windows1252) == "Tester")

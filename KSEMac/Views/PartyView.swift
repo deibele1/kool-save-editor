@@ -32,17 +32,18 @@ struct PartyView: View {
                             })) {
                             HStack {
                                 Text(document.companionName(member.index))
-                                if !member.isAvailable {
-                                    Text("Not available").font(.caption).foregroundStyle(.secondary)
+                                if let note = note(for: member) {
+                                    Text(note).font(.caption).foregroundStyle(.secondary)
                                 }
                             }
                         }
-                        .disabled(!member.isAvailable || (!current.contains(member.index) && current.count >= SaveGame.maximumPartySize))
+                        .disabled(!save.canToggleCompanion(member.index)
+                                  || (!current.contains(member.index) && current.count >= SaveGame.maximumPartySize))
                     }
                 } header: {
                     Text("Active Party")
                 } footer: {
-                    Text("Up to two available companions travel with the player.").foregroundStyle(.secondary)
+                    Text(partyFooter(save)).foregroundStyle(.secondary)
                 }
 
                 if save.supportsInfluence {
@@ -60,5 +61,25 @@ struct PartyView: View {
             }
             .formStyle(.grouped)
         }
+    }
+
+    private func note(for member: PartyMember) -> String? {
+        if member.isControlled { return "You’re playing as this companion" }
+        if !member.isAvailable { return "Not available" }
+        return member.isSelectable ? nil : "Locked by the story"
+    }
+
+    private func partyFooter(_ save: SaveGame) -> String {
+        if let controlled = save.controlledCompanion {
+            return "You’re playing as \(document.companionName(controlled)) at this point in the story, so the party can’t be changed until the game switches back to your character."
+        }
+        if save.isSoloMode {
+            return "The story has your character going on alone at this point, so the party can’t be changed."
+        }
+        if !save.canChangeParty {
+            return "You’re playing as a companion at this point in the story, so the party can’t be changed until the game switches back to your character."
+        }
+        let locked = save.partyMembers.contains { $0.isAvailable && !$0.isSelectable }
+        return "Up to two available companions travel with the player." + (locked ? " Companions the story has locked can’t be added or removed." : "")
     }
 }

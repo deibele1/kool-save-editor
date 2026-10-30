@@ -6,7 +6,9 @@
 // Fixes relative to KSE: editing Force Points no longer writes into the struct's first
 // field; changing a Jedi class to a non-Jedi class removes the power lists (KSE's
 // condition could never be true); classes, feats and powers are addressed by position
-// or ID instead of display text; renaming the player also updates Mod_FirstName.
+// or ID instead of display text; renaming the player also updates Mod_FirstName;
+// attributes stop at 100 and skill ranks at 127, values the games read without wrapping
+// around; a class can't be added twice or as a third class.
 
 import Aurora
 import Foundation
@@ -146,9 +148,15 @@ public struct Creature: Sendable, Equatable {
 
     // MARK: Statistics
 
+    /// The highest attribute score that can be set. The games add the item and Force bonuses
+    /// (one signed byte, so at most +127) and the racial adjustment to the stored score in
+    /// 8 bits: a total above 255 wraps around (255 with a +2 belt is read as 1). 100 + 127
+    /// still leaves room for the racial adjustments, and 100 is already a +45 modifier.
+    public static let maximumAbilityScore = 100
+
     public subscript(ability: Ability) -> Int {
         get { root.integer(ability.rawValue) ?? 0 }
-        set { root.setInteger(ability.rawValue, newValue, type: .byte) }
+        set { root.setInteger(ability.rawValue, min(Self.maximumAbilityScore, max(0, newValue)), type: .byte) }
     }
 
     /// Base hit points; as in KSE, setting them also refills the current hit points.
@@ -207,6 +215,12 @@ public struct Creature: Sendable, Equatable {
 
     // MARK: Skills
 
+    /// The highest skill rank that can be set: the games read a rank as a signed byte, so
+    /// 128–255 are negative ranks (255 is −1). A skill's total with its bonuses is capped at
+    /// 127 by the game (The Sith Lords' GetSkillRank), so it can't wrap.
+    public static let maximumSkillRank = 127
+
+    /// The stored ranks, as bytes: a rank above `maximumSkillRank` is negative in the game.
     public var skillRanks: [Int] {
         root.list("SkillList")?.map { $0.integer("Rank") ?? 0 } ?? []
     }
@@ -214,7 +228,7 @@ public struct Creature: Sendable, Equatable {
     public mutating func setSkillRank(_ skill: Int, _ rank: Int) {
         root.updateList("SkillList", create: true) { list in
             while list.count <= skill { list.append(GFFStruct(id: 0, fields: [GFFField(label: "Rank", value: .byte(0))])) }
-            list[skill].setInteger("Rank", rank, type: .byte)
+            list[skill].setInteger("Rank", min(Self.maximumSkillRank, max(0, rank)), type: .byte)
         }
     }
 
@@ -251,6 +265,27 @@ public struct Creature: Sendable, Equatable {
     /// Total character level.
     public var level: Int { classes.reduce(0) { $0 + $1.level } }
 
+    /// The games give a creature at most two classes and ignore further ClassList entries.
+    public static let maximumClassCount = 2
+
+    /// Whether `classID` can be added: only as a second class, and not one the creature has
+    /// (the games fail to load a creature that lists a class twice).
+    public func canAddClass(_ classID: Int) -> Bool {
+        classes.count < Self.maximumClassCount && !classes.contains { $0.classID == classID }
+    }
+
+    /// Whether class entry `index` can become `classID`: not when the other class already is.
+    public func canChangeClass(_ index: Int, to classID: Int) -> Bool {
+        classes.indices.contains(index) && !classes.contains { $0.index != index && $0.classID == classID }
+    }
+
+    /// The highest level class entry `index` can have without the total level passing `cap`,
+    /// the game's level cap; never below the entry's current level or 1.
+    public func levelLimit(forClass index: Int, cap: Int) -> Int {
+        let others = classes.filter { $0.index != index }.reduce(0) { $0 + $1.level }
+        return max(1, classes.first { $0.index == index }?.level ?? 1, cap - others)
+    }
+
     private mutating func updateClass(_ index: Int, _ body: (inout GFFStruct) -> Void) {
         root.updateList("ClassList") { list in
             guard list.indices.contains(index) else { return }
@@ -269,7 +304,9 @@ public struct Creature: Sendable, Equatable {
         updateClass(index) { $0.setInteger("ClassLevel", level, type: .short) }
     }
 
+    /// Does nothing when the creature's other class is `classID` (see `canChangeClass`).
     public mutating func changeClass(_ index: Int, to classID: Int, isSpellcaster: Bool) {
+        guard canChangeClass(index, to: classID) else { return }
         updateClass(index) { entry in
             entry.setInteger("Class", classID, type: .int)
             if isSpellcaster {
@@ -281,7 +318,9 @@ public struct Creature: Sendable, Equatable {
         }
     }
 
+    /// Adds a class at level 1; does nothing when `canAddClass` is false.
     public mutating func addClass(_ classID: Int, isSpellcaster: Bool) {
+        guard canAddClass(classID) else { return }
         root.updateList("ClassList", create: true) { list in
             var entry = GFFStruct(id: 2, fields: [GFFField(label: "Class", value: .int(Int32(clamping: classID))),
                                                   GFFField(label: "ClassLevel", value: .short(1))])
